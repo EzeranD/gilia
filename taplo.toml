@@ -1,0 +1,11 @@
+exclude = [".direnv/**"]
+
+[formatting]
+reorder_keys = false
+
+[[rule]]
+include = ["**/*.toml"]
+keys = ["dependencies"]
+
+[rule.formatting]
+reorder_keys = true
