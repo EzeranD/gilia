@@ -60,7 +60,7 @@ impl Demuxer {
                         let time_base = self.ictx.stream(idx).unwrap().time_base();
                         let pts = packet.pts().map(|ts| ts.rescale(time_base, (1, 1000)));
                         if Some(idx) == self.video_idx {
-                            let Some(video_tx) = self.video_stream_tx.as_ref() else {
+                            let Some(video_tx) = &self.video_stream_tx else {
                                 continue;
                             };
                             crossbeam_channel::select_biased! {
@@ -73,7 +73,7 @@ impl Demuxer {
                                 }
                             }
                         } else if Some(idx) == self.audio_idx {
-                            let Some(audio_tx) = self.audio_stream_tx.as_ref() else {
+                            let Some(audio_tx) = &self.audio_stream_tx else {
                                 continue;
                             };
                             crossbeam_channel::select_biased! {
@@ -86,7 +86,7 @@ impl Demuxer {
                                 }
                             }
                         } else if Some(idx) == self.sub_idx {
-                            let Some(sub_tx) = self.sub_stream_tx.as_ref() else {
+                            let Some(sub_tx) = &self.sub_stream_tx else {
                                 continue;
                             };
                             crossbeam_channel::select_biased! {

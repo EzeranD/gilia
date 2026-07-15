@@ -1,16 +1,14 @@
 use std::{
-    cell::{Cell, RefCell},
-    collections::VecDeque,
     io::Cursor,
-    rc::Rc,
     slice,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
-type AudioBuffer = Rc<RefCell<VecDeque<(Vec<f32>, i64)>>>;
-
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use libspa_sys::SPA_PROP_channelVolumes;
 use pipewire::{
     context::ContextRc,
@@ -23,17 +21,19 @@ use pipewire::{
         utils::Direction,
     },
     stream::{StreamFlags, StreamRc},
+    sys::pw_stream_get_nsec,
 };
 use tracing::warn;
 
 use crate::{
+    audio::queue::Consumer,
     core::{AbEffect, PlayerEvent},
-    engine::{ExternalCallback, ExternalEvent},
-    sync::{AudioFrames, Clock, Nanoseconds},
+    engine::{ExternalCallback, ExternalEvent, get_engine_start},
+    sync::Clock,
 };
 
 pub fn spawn(
-    audio_buffer: Receiver<(Vec<f32>, i64)>,
+    mut audio_buffer: Consumer,
     ab_effect_rx: pipewire::channel::Receiver<AbEffect>,
     ab_event_tx: Sender<PlayerEvent>,
     rate: u32,
@@ -80,17 +80,11 @@ pub fn spawn(
         .0
         .into_inner();
         let mut params = [Pod::from_bytes(&values).unwrap()];
-        let pending: AudioBuffer = Rc::new(RefCell::new(VecDeque::new()));
-        let block_offset = Rc::new(Cell::new(0));
-        let flush_flag = Rc::new(Cell::new(false));
-        let drain_flag = Rc::new(Cell::new(false));
+        let drain_flag = Arc::new(AtomicBool::new(false));
         let pw_audio_buffer = audio_buffer.clone();
-
+        let pw_event_tx = ab_event_tx.clone();
         let recv_stream = stream.clone();
-        let recv_block_offset = block_offset.clone();
-        let recv_flush = flush_flag.clone();
         let recv_drain = drain_flag.clone();
-        let listener_event = ab_event_tx.clone();
         let _receiver = ab_effect_rx.attach(mainloop.loop_(), {
             move |e| match e {
                 AbEffect::ModifyVolume(mut volumes) => {
@@ -108,15 +102,18 @@ pub fn spawn(
                     }
                 }
                 AbEffect::FlushConsumers => {
-                    while pw_audio_buffer.try_recv().is_ok() {}
-                    recv_block_offset.set(0);
-                    recv_flush.set(true);
-                    recv_stream.trigger_process().unwrap();
+                    // SAFETY: This is called after AbEffect::Output(false) so
+                    // it should be safe to clear the buffer.
+                    // TODO need to do some more testing but so far seems to be good
+                    // just putting this here for clarity and as a reminder
+                    unsafe {
+                        pw_audio_buffer.clear();
+                    }
                     recv_stream.flush(false).unwrap();
                     let _ = ab_event_tx.send(PlayerEvent::AudioBackendFlushed);
                 }
                 AbEffect::DrainOutput => {
-                    recv_drain.set(true);
+                    recv_drain.store(true, Ordering::Relaxed);
                 }
             }
         });
@@ -131,7 +128,7 @@ pub fn spawn(
                     let mut volumes_guard = audio_volume.lock().unwrap();
                     volumes_guard.clear();
                     volumes_guard.extend(volumes.iter().map(|f| f.powf(1.0 / 3.0)));
-                    if let Some(cb) = callback.as_ref() {
+                    if let Some(cb) = &callback {
                         cb(ExternalEvent::VolumesChanged(volumes_guard.clone()));
                     }
                 }
@@ -147,64 +144,39 @@ pub fn spawn(
                             std::mem::size_of::<pipewire::sys::pw_time>(),
                         )
                     };
-                    let drain = drain_flag.get();
+
                     let datas = buf.datas_mut();
                     let data = &mut datas[0];
-                    let target_data = data.data().unwrap();
-                    let target_f32: &mut [f32] = bytemuck::cast_slice_mut(target_data);
-                    let nsamples = target_f32.len();
-                    let mut pending = pending.borrow_mut();
-                    if flush_flag.get() {
-                        pending.clear();
-                        flush_flag.set(false);
-                    }
-                    while let Ok((block, pts)) = audio_buffer.try_recv() {
-                        pending.push_back((block, pts));
-                    }
-                    let total_samples = pending.iter().map(|(block, _)| block.len()).sum::<usize>();
-                    if total_samples == 0 && drain {
-                        let _ = listener_event.send(PlayerEvent::SamplesDrained);
-                    }
-                    let mut needed_samples = (nsamples).min(total_samples);
-                    let mut sample_offset = 0;
-                    let mut current_pts = 0;
-                    while needed_samples > 0 {
-                        if let Some((block, pts)) = pending.front_mut() {
-                            let mut offset = block_offset.get();
-                            let block_remaining = block.len() - offset;
-                            let taken = (needed_samples.min(block_remaining) / 2) * 2;
-                            let slice = &block[offset..offset + taken];
-                            target_f32[sample_offset..sample_offset + slice.len()]
-                                .copy_from_slice(slice);
-                            sample_offset += slice.len();
-                            needed_samples -= taken;
-                            offset += taken;
-                            current_pts = (*pts * 1_000_000)
-                                + (offset as i64 / 2) * 1_000_000_000 / rate as i64;
-                            block_offset.set(offset);
-                            if offset >= block.len() {
-                                pending.pop_front();
-                                block_offset.set(0);
-                            }
-                        }
-                    }
+                    let Some(target_data) = data.data() else {
+                        return;
+                    };
 
-                    if sample_offset > 0 {
-                        let sent_frames = AudioFrames(sample_offset as i64 / 2);
-                        let mut now = Nanoseconds::from_engine_start();
-                        now += Nanoseconds::from_frames(sent_frames, rate);
-                        now += Nanoseconds(
-                            time.delay * 1_000_000_000 * time.rate.num as i64
-                                / time.rate.denom as i64,
-                        );
-                        now += Nanoseconds::from_frames(AudioFrames(time.queued as i64 / 8), rate);
-                        now += Nanoseconds::from_frames(AudioFrames(time.buffered as i64), rate);
-                        audio_clock.update(current_pts, now.0);
+                    if let Some((filled, pts_ns)) = audio_buffer.fill(rate as usize, target_data) {
+                        let rate = rate as i64;
+                        let stride = audio_buffer.stride as i64;
+                        let mut end = get_engine_start().elapsed().as_nanos() as i64;
+                        end += (filled as i64 * 1_000_000_000) / rate;
+                        end += (time.delay * 1_000_000_000 * time.rate.num as i64)
+                            / time.rate.denom as i64;
+                        end += (time.queued as i64 * 1_000_000_000) / (rate * stride);
+                        end += (time.buffered as i64 * 1_000_000_000) / rate;
+                        end -= unsafe { pw_stream_get_nsec(stream.as_raw_ptr()) } as i64 - time.now;
+
+                        audio_clock.update(pts_ns, end);
+                        let chunk = data.chunk_mut();
+                        *chunk.offset_mut() = 0;
+                        *chunk.stride_mut() = audio_buffer.stride as i32;
+                        *chunk.size_mut() = (filled * audio_buffer.stride) as u32;
+                    } else {
+                        if drain_flag.load(Ordering::Relaxed) {
+                            let _ = pw_event_tx.send(PlayerEvent::SamplesDrained);
+                            drain_flag.store(false, Ordering::Relaxed);
+                        }
+                        let chunk = data.chunk_mut();
+                        *chunk.offset_mut() = 0;
+                        *chunk.stride_mut() = audio_buffer.stride as i32;
+                        *chunk.size_mut() = 0;
                     }
-                    let chunk = data.chunk_mut();
-                    *chunk.offset_mut() = 0;
-                    *chunk.stride_mut() = 8;
-                    *chunk.size_mut() = (sample_offset * 4) as u32;
                 }
             })
             .register();

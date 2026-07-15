@@ -1499,6 +1499,7 @@ dependencies = [
  "ash",
  "bytemuck",
  "crossbeam-channel",
+ "crossbeam-utils",
  "ffmpeg-next",
  "libass",
  "libspa-sys",

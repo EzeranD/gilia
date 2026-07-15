@@ -1,3 +1,5 @@
+use std::{mem, thread};
+
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use ffmpeg_next::{
     ChannelLayout, Packet, Rational, Rescale,
@@ -8,13 +10,16 @@ use ffmpeg_next::{
 };
 use tracing::{debug, error};
 
-use crate::core::{DecoderEffect, PlayerEvent};
+use crate::{
+    audio::queue::{AudioBlock, Producer, PushError},
+    core::{DecoderEffect, PlayerEvent},
+};
 
 pub struct AudioDecoder {
     decoder: Audio,
     resampler: resampling::Context,
     stream: Receiver<Packet>,
-    audio_buffer: Sender<(Vec<f32>, i64)>,
+    audio_buffer: Producer,
     time_base: Rational,
     effect_rx: Receiver<DecoderEffect>,
     event_tx: Sender<PlayerEvent>,
@@ -33,7 +38,7 @@ impl AudioDecoder {
     pub fn new(
         decoder: Audio,
         stream: Receiver<Packet>,
-        audio_buffer: Sender<(Vec<f32>, i64)>,
+        audio_buffer: Producer,
         time_base: Rational,
         effect_rx: Receiver<DecoderEffect>,
         event_tx: Sender<PlayerEvent>,
@@ -103,7 +108,7 @@ impl AudioDecoder {
             error!("send_packet error: {e}");
         }
 
-        loop {
+        'receive: loop {
             let mut audio = frame::Audio::empty();
             if self.decoder.receive_frame(&mut audio).is_err() {
                 break;
@@ -114,30 +119,56 @@ impl AudioDecoder {
 
             let plane = new_audio.plane::<(f32, f32)>(0);
             let samples: Vec<f32> = plane.iter().flat_map(|&(l, r)| [l, r]).collect();
-
+            let bytes: &[u8] = bytemuck::cast_slice(&samples);
+            let frames = bytes.len() / (2 * mem::size_of::<f32>());
             let block_pts = packet_pts;
             let block_duration = new_audio.samples() as u32 * 1000 / self.decoder.rate();
             packet_pts += block_duration as i64;
 
+            let mut block = AudioBlock {
+                data: Box::from(bytes),
+                frames,
+                pts: block_pts,
+            };
+
             if let Some(sync_pts) = self.sync_target {
-                if block_pts >= sync_pts {
-                    crossbeam_channel::select_biased! {
-                        recv(self.effect_rx) -> effect => {
-                            self.effect_recv(effect.unwrap());
+                if block_pts < sync_pts {
+                    continue;
+                }
+                loop {
+                    match self.effect_rx.try_recv() {
+                        Ok(effect) => {
+                            self.effect_recv(effect);
+                            break 'receive;
+                        }
+                        Err(TryRecvError::Disconnected) => return,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                    match self.audio_buffer.try_push(block) {
+                        Ok(()) => break,
+                        Err(PushError::Full(ret)) => block = ret,
+                    }
+                    thread::park();
+                }
+                self.sync_target = None;
+                let _ = self.event_tx.send(PlayerEvent::AudioSynced);
+            } else {
+                loop {
+                    match self.effect_rx.try_recv() {
+                        Ok(effect) => {
+                            self.effect_recv(effect);
+                            break 'receive;
+                        }
+                        Err(TryRecvError::Disconnected) => return,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                    match self.audio_buffer.try_push(block) {
+                        Ok(()) => {
                             break;
                         }
-                        send(self.audio_buffer, (samples, block_pts)) -> _res => {}
+                        Err(PushError::Full(ret)) => block = ret,
                     }
-                    self.sync_target = None;
-                    let _ = self.event_tx.send(PlayerEvent::AudioSynced);
-                }
-            } else {
-                crossbeam_channel::select_biased! {
-                    recv(self.effect_rx) -> effect => {
-                        self.effect_recv(effect.unwrap());
-                        break;
-                    }
-                    send(self.audio_buffer, (samples, block_pts)) -> _res => {}
+                    thread::park();
                 }
             }
         }

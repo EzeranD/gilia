@@ -4,7 +4,6 @@ use lmv_engine::{
     EngineConfig, ExternalEvent, PlaybackMode, PlaybackPhase, PlayerEngine, PlayerEvent,
 };
 use lmv_iced::widget::PlayerWidget;
-use tracing::debug;
 
 pub struct Player {
     engine: PlayerEngine,
@@ -18,7 +17,7 @@ impl Player {
     ) -> Self {
         let mut engine = PlayerEngine::new(config);
         engine.set_callback(callback);
-        engine.open(path);
+        let _ = engine.open(path);
         Self { engine }
     }
     pub fn view(&self) -> PlayerWidget<'_> {
@@ -31,9 +30,7 @@ impl Player {
         self.engine.apply_event(PlayerEvent::Pause);
     }
     pub fn toggle_playback(&mut self) {
-        let pos = self.position_ms().unwrap_or(0);
         let state = self.engine.state.load();
-        debug!("toggle state: {:?}, pos: {pos}ms", state.as_ref());
         match state.mode {
             PlaybackMode::Playing => {
                 self.pause();

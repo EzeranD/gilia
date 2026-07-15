@@ -4,7 +4,7 @@ use iced::{
     Element, Event, Length, Rectangle, Size,
     advanced::{Layout, Shell, Widget, layout, mouse, renderer, widget::Tree},
 };
-use lmv_engine::{PlaybackMode, PlaybackPhase, PlayerEngine};
+use lmv_engine::{PlaybackMode, PlayerEngine};
 
 use crate::{subs::SubPrimitive, video::VideoPrimitive};
 
@@ -80,8 +80,7 @@ where
         _viewport: &Rectangle,
     ) {
         let state = self.engine.state.load();
-        let playing = matches!(state.mode, PlaybackMode::Playing)
-            || matches!(state.phase, PlaybackPhase::Seeking(_));
+        let playing = state.mode == PlaybackMode::Playing;
         let redraw_requested = matches!(
             event,
             Event::Window(iced::window::Event::RedrawRequested(_))

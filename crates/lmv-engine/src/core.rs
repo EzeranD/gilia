@@ -58,7 +58,7 @@ pub enum TrackDrainState {
     OutputDrained,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeekingState {
     pub pts: Pts,
     pub audio: TrackSeekState,
@@ -89,7 +89,7 @@ impl SeekingState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DrainingState {
     pub audio: TrackDrainState,
     pub video: TrackDrainState,
@@ -122,13 +122,13 @@ pub struct PlayerCore {
     streams: ActiveStreams,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackMode {
     Paused,
     Playing,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackPhase {
     Normal,
     Seeking(SeekingState),
@@ -174,6 +174,11 @@ impl PlayerCore {
             PlayerEvent::Seek(pts) => {
                 self.phase = PlaybackPhase::Seeking(SeekingState::new(pts));
                 dispatch.demuxer(DemuxerEffect::SeekDemuxer(pts));
+                dispatch.ab(AbEffect::Output(false));
+                if let Some(clock) = &dispatch.audio_clock {
+                    let now = crate::engine::get_engine_start().elapsed().as_nanos() as i64;
+                    clock.update(pts * 1_000_000, now);
+                }
             }
             PlayerEvent::DemuxerSeeked => {
                 dispatch.audio(DecoderEffect::Flush);
@@ -253,7 +258,6 @@ impl PlayerCore {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     draining.video = TrackDrainState::OutputDrained;
                     if draining.is_drained(&self.streams) {
-                        dispatch.ab(AbEffect::Output(false));
                         self.phase = PlaybackPhase::Eof;
                     }
                 }
@@ -262,7 +266,6 @@ impl PlayerCore {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     draining.audio = TrackDrainState::OutputDrained;
                     if draining.is_drained(&self.streams) {
-                        dispatch.ab(AbEffect::Output(false));
                         self.phase = PlaybackPhase::Eof;
                     }
                 }

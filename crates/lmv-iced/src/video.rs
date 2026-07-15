@@ -502,7 +502,7 @@ impl shader::Primitive for VideoPrimitive {
         target: &iced::wgpu::TextureView,
         clip_bounds: &iced::Rectangle<u32>,
     ) {
-        let Some(bind_group) = pipeline.bind_group.as_ref() else {
+        let Some(bind_group) = &pipeline.bind_group else {
             return;
         };
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {

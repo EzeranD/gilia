@@ -23,7 +23,11 @@ use libass::{OverrideBits, Style};
 use tracing::{debug, error};
 
 use crate::{
-    audio::{self, decoder::AudioDecoder},
+    audio::{
+        self,
+        decoder::AudioDecoder,
+        queue::{ThreadWaker, WakingSender, channel, queue},
+    },
     core::{
         AbEffect, ActiveStreams, DecoderEffect, DemuxerEffect, PlaybackMode, PlaybackPhase,
         PlayerCore, PlayerEvent, PlayerSnapshot,
@@ -130,25 +134,31 @@ impl PlayerEngine {
 
         if let Some(audio_stream) = audio_stream {
             audio_idx = Some(audio_stream.1);
-            let (audio_buffer_tx, audio_buffer_rx) = crossbeam_channel::bounded(50);
-            let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
+
             let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::bounded(50);
             let (pw_tx, pw_rx) = pipewire::channel::channel();
-            channels.audio_tx = Some(audio_tx);
+
             channels.audio_packet_tx = Some(audio_packet_tx);
             channels.pw_tx = Some(pw_tx);
 
             let audio_clock = Arc::new(Clock::default());
+            channels.audio_clock = Some(audio_clock.clone());
             self.audio_info.audio_clock = Some(audio_clock.clone());
 
             let audio_context = Context::from_parameters(audio_stream.0.parameters()).unwrap();
             let audio_time_base = audio_stream.0.time_base();
             let decoder = audio_context.decoder().audio().unwrap();
             let audio_rate = decoder.rate();
+            let waker = Arc::new(ThreadWaker::new());
+            let (audio_tx, audio_rx) = channel(waker.clone());
+            channels.audio_tx = Some(audio_tx);
+            let (audio_buffer_tx, audio_buffer_rx) = queue(128, waker.clone());
             let audio_event_tx = event_tx.clone();
+            let decoder_waker = waker.clone();
             std::thread::Builder::new()
                 .name("audio-decoder".into())
                 .spawn(move || {
+                    decoder_waker.set();
                     let mut audio_decoder = AudioDecoder::new(
                         decoder,
                         audio_packet_rx,
@@ -502,7 +512,7 @@ pub fn get_stream(ictx: &Input, stream_type: Type) -> Option<(Stream<'_>, usize)
 
 pub struct PlayerChannels {
     pub demuxer_tx: Option<Sender<DemuxerEffect>>,
-    pub audio_tx: Option<Sender<DecoderEffect>>,
+    pub audio_tx: Option<WakingSender>,
     pub audio_packet_tx: Option<Sender<Packet>>,
     pub pw_tx: Option<pipewire::channel::Sender<AbEffect>>,
     pub video_tx: Option<Sender<DecoderEffect>>,
@@ -511,6 +521,7 @@ pub struct PlayerChannels {
     pub sub_packet_tx: Option<Sender<Packet>>,
     pub frame_rx: Option<Receiver<VideoFrame>>,
     pub next_frame: Option<Arc<Mutex<Option<VideoFrame>>>>,
+    pub audio_clock: Option<Arc<Clock>>,
 }
 
 impl PlayerChannels {
@@ -526,23 +537,34 @@ impl PlayerChannels {
             sub_packet_tx: None,
             frame_rx: None,
             next_frame: None,
+            audio_clock: None,
         }
     }
 
     pub fn ab(&self, effect: AbEffect) {
-        self.pw_tx.as_ref().map(|tx| tx.send(effect).ok());
+        if let Some(tx) = &self.pw_tx {
+            let _ = tx.send(effect);
+        }
     }
     pub fn demuxer(&self, effect: DemuxerEffect) {
-        self.demuxer_tx.as_ref().map(|tx| tx.send(effect).ok());
+        if let Some(tx) = &self.demuxer_tx {
+            let _ = tx.send(effect);
+        }
     }
     pub fn audio(&self, effect: DecoderEffect) {
-        self.audio_tx.as_ref().map(|tx| tx.send(effect).ok());
+        if let Some(tx) = &self.audio_tx {
+            let _ = tx.send(effect);
+        }
     }
     pub fn video(&self, effect: DecoderEffect) {
-        self.video_tx.as_ref().map(|tx| tx.send(effect).ok());
+        if let Some(tx) = &self.video_tx {
+            let _ = tx.send(effect);
+        }
     }
     pub fn sub(&self, effect: DecoderEffect) {
-        self.sub_tx.as_ref().map(|tx| tx.send(effect).ok());
+        if let Some(tx) = &self.sub_tx {
+            let _ = tx.send(effect);
+        }
     }
 
     pub fn flush_frames(&self) {
