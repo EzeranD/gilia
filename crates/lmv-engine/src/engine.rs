@@ -47,6 +47,7 @@ pub fn get_engine_start() -> &'static Instant {
 #[derive(Debug, Clone)]
 pub enum ExternalEvent {
     VolumesChanged(Vec<f32>),
+    Eof,
 }
 
 pub type ExternalCallback = Arc<dyn Fn(ExternalEvent) + Send + Sync>;
@@ -123,6 +124,7 @@ impl PlayerEngine {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         self.event_tx = Some(event_tx.clone());
         let mut channels = PlayerChannels::new();
+        channels.external_callback = self.external_callback.clone();
 
         let audio_stream = get_stream(&ictx, Type::Audio);
         let video_stream = get_stream(&ictx, Type::Video);
@@ -392,7 +394,7 @@ impl PlayerEngine {
                 match frame_rx.try_recv() {
                     Ok(f) => f,
                     Err(TryRecvError::Empty) => {
-                        if self.video_output.drain.load(Ordering::Relaxed) {
+                        if matches!(self.state.load().phase, PlaybackPhase::Draining(_)) {
                             self.apply_event(PlayerEvent::FramesDrained);
                             return (false, 1);
                         }
@@ -407,6 +409,7 @@ impl PlayerEngine {
             let current_pts = current_frame.info.pts.unwrap();
             let av_offset = current_pts - audio_ms;
             debug!("audio ms: {audio_ms}, av_offset: {av_offset}");
+
             if av_offset > THRESHOLD {
                 *self.video_output.next_frame.lock().unwrap() = Some(current_frame);
                 return (false, (av_offset - THRESHOLD) as u64);
@@ -521,6 +524,7 @@ pub struct PlayerChannels {
     pub sub_packet_tx: Option<Sender<Packet>>,
     pub frame_rx: Option<Receiver<VideoFrame>>,
     pub next_frame: Option<Arc<Mutex<Option<VideoFrame>>>>,
+    pub external_callback: Option<ExternalCallback>,
     pub audio_clock: Option<Arc<Clock>>,
 }
 
@@ -537,6 +541,7 @@ impl PlayerChannels {
             sub_packet_tx: None,
             frame_rx: None,
             next_frame: None,
+            external_callback: None,
             audio_clock: None,
         }
     }

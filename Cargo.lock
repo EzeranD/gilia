@@ -1479,16 +1479,11 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "lmv"
 version = "0.1.0"
 dependencies = [
- "clap",
  "ffmpeg-next",
- "iced",
  "lmv-engine",
  "lmv-iced",
  "pipewire",
- "time",
- "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1519,6 +1514,21 @@ dependencies = [
  "iced_wgpu",
  "libass",
  "lmv-engine",
+]
+
+[[package]]
+name = "lmviewer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ffmpeg-next",
+ "iced",
+ "lmv",
+ "pipewire",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

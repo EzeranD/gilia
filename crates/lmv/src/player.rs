@@ -20,15 +20,20 @@ impl Player {
         let _ = engine.open(path);
         Self { engine }
     }
+
+    #[cfg(feature = "iced")]
     pub fn view(&self) -> PlayerWidget<'_> {
         PlayerWidget::new(&self.engine)
     }
+
     pub fn play(&mut self) {
         self.engine.apply_event(PlayerEvent::Play);
     }
+
     pub fn pause(&mut self) {
         self.engine.apply_event(PlayerEvent::Pause);
     }
+
     pub fn toggle_playback(&mut self) {
         let state = self.engine.state.load();
         match state.mode {
@@ -38,8 +43,17 @@ impl Player {
             PlaybackMode::Paused => {
                 self.play();
             }
+            PlaybackMode::Stopped => {}
         }
     }
+
+    pub fn seek_to(&mut self, pos_ms: i64) {
+        let state = self.engine.state.load();
+        if !matches!(state.phase, PlaybackPhase::Seeking(_)) {
+            self.engine.apply_event(PlayerEvent::Seek(pos_ms));
+        }
+    }
+
     pub fn seek_rel(&mut self, offset_ms: i64) {
         let state = self.engine.state.load();
         if !matches!(state.phase, PlaybackPhase::Seeking(_)) {

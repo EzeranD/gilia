@@ -1,21 +1,33 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
 use iced::{
     Background, Color, Element, Length, Task, Theme,
     futures::{self, SinkExt},
-    keyboard::{self, key::Named},
+    keyboard::{
+        self,
+        Key::{self, Character, Named},
+        Modifiers,
+        key::Named::{ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Space},
+    },
     mouse::ScrollDelta,
     widget::{container, mouse_area, stack, text},
     window::{self, Settings},
 };
+use lmv::{
+    engine::{
+        EngineConfig,
+        ExternalEvent::{self, VolumesChanged},
+    },
+    player::Player,
+};
 use time::{UtcOffset, macros::format_description};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt::time::OffsetTime};
-mod player;
-use lmv::engine::{EngineConfig, ExternalEvent};
-
-use crate::player::Player;
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -59,7 +71,7 @@ fn main() -> iced::Result {
 pub enum Message {
     WindowClosed(window::Id),
     VideoHovered(bool),
-    KeyPressed(keyboard::Key),
+    KeyPressed(Key, keyboard::Modifiers),
     Scroll(ScrollDelta),
     CallbackEvent(ExternalEvent),
     ClearText(u32),
@@ -77,6 +89,8 @@ struct App {
     first_volume_change: bool,
     text_id: u32,
     text: Option<String>,
+    last_seek_time: Instant,
+    eof_loop: bool,
 }
 
 impl App {
@@ -107,6 +121,8 @@ impl App {
                 first_volume_change: true,
                 text_id: 0,
                 text: None,
+                last_seek_time: Instant::now(),
+                eof_loop: false,
             },
             Task::batch([open, event_task]),
         )
@@ -116,8 +132,8 @@ impl App {
         iced::Subscription::batch([
             window::close_events().map(Message::WindowClosed),
             keyboard::listen().filter_map(|e| {
-                if let keyboard::Event::KeyPressed { key, .. } = e {
-                    Some(Message::KeyPressed(key))
+                if let keyboard::Event::KeyPressed { key, modifiers, .. } = e {
+                    Some(Message::KeyPressed(key, modifiers))
                 } else {
                     None
                 }
@@ -138,53 +154,7 @@ impl App {
                 self.video_hovered = bool;
                 Task::none()
             }
-            Message::KeyPressed(key) => {
-                if self.video_hovered {
-                    match key {
-                        keyboard::Key::Named(named) => match named {
-                            Named::Space => {
-                                self.player.toggle_playback();
-                                Task::none()
-                            }
-                            Named::ArrowUp => self.adjust_volume(0.02),
-                            Named::ArrowDown => self.adjust_volume(-0.02),
-                            Named::ArrowLeft => {
-                                self.player.seek_rel(-5000);
-                                Task::none()
-                            }
-                            Named::ArrowRight => {
-                                self.player.seek_rel(5000);
-                                Task::none()
-                            }
-                            _ => Task::none(),
-                        },
-                        keyboard::Key::Character(char) => match char.as_str() {
-                            "f" => {
-                                let Some(main_id) = self.main_id() else {
-                                    return Task::none();
-                                };
-                                window::mode(main_id).map(Message::GotMode)
-                            }
-                            "k" => {
-                                self.player.toggle_playback();
-                                Task::none()
-                            }
-                            "j" => {
-                                self.player.seek_rel(-10000);
-                                Task::none()
-                            }
-                            "l" => {
-                                self.player.seek_rel(10000);
-                                Task::none()
-                            }
-                            _ => Task::none(),
-                        },
-                        keyboard::Key::Unidentified => Task::none(),
-                    }
-                } else {
-                    Task::none()
-                }
-            }
+            Message::KeyPressed(key, modifiers) => self.key_pressed(key, modifiers),
             Message::Scroll(delta) => match delta {
                 ScrollDelta::Lines { x: _, y } => {
                     if y > 0.0 {
@@ -196,21 +166,22 @@ impl App {
                 }
                 ScrollDelta::Pixels { x: _, y: _ } => Task::none(),
             },
-            Message::CallbackEvent(external_event) => match external_event {
-                ExternalEvent::VolumesChanged(volumes) => {
-                    if self.first_volume_change {
-                        self.first_volume_change = false;
-                        return Task::none();
-                    }
-                    let text_id = self.text_id + 1;
-                    self.text_id = text_id;
-                    let channel1_vol = volumes.first().copied().unwrap_or(0.0);
-                    self.text = Some(format!("Volume {}%", (channel1_vol * 100.0).round() as u32));
-                    Task::perform(tokio::time::sleep(Duration::from_secs(2)), move |_| {
-                        Message::ClearText(text_id)
-                    })
+            Message::CallbackEvent(VolumesChanged(volumes)) => {
+                if self.first_volume_change {
+                    self.first_volume_change = false;
+                    return Task::none();
                 }
-            },
+                let channel1_vol = volumes.first().copied().unwrap_or(0.0);
+                let text = format!("Volume {}%", (channel1_vol * 100.0).round() as u32);
+                self.set_text(text, Duration::from_secs(2))
+            }
+            Message::CallbackEvent(ExternalEvent::Eof) => {
+                if self.eof_loop {
+                    self.player.seek_to(0);
+                    self.player.play();
+                }
+                Task::none()
+            }
             Message::ClearText(id) => {
                 if self.text_id == id {
                     self.text = None;
@@ -230,14 +201,90 @@ impl App {
         }
     }
 
-    fn adjust_volume(&mut self, change: f32) -> Task<Message> {
-        let channel1_vol = self.player.modify_volumes(|v| (v + change).clamp(0.0, 1.5));
+    fn set_text(&mut self, text: String, duration: Duration) -> Task<Message> {
         let text_id = self.text_id + 1;
         self.text_id = text_id;
-        self.text = Some(format!("Volume {}%", (channel1_vol * 100.0).round() as u32));
-        Task::perform(tokio::time::sleep(Duration::from_secs(2)), move |()| {
+        self.text = Some(text);
+        Task::perform(tokio::time::sleep(duration), move |_| {
             Message::ClearText(text_id)
         })
+    }
+
+    fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
+        if self.video_hovered {
+            match key.as_ref() {
+                Named(Space) | Character("k") => {
+                    self.player.toggle_playback();
+                    Task::none()
+                }
+                Named(ArrowUp) => self.adjust_volume(0.02),
+                Named(ArrowDown) => self.adjust_volume(-0.02),
+                Named(ArrowLeft) => {
+                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
+                        self.last_seek_time = Instant::now();
+                        self.player.seek_rel(-5000);
+                    }
+                    Task::none()
+                }
+                Named(ArrowRight) => {
+                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
+                        self.last_seek_time = Instant::now();
+                        self.player.seek_rel(5000);
+                    }
+                    Task::none()
+                }
+                Character("f") => {
+                    let Some(main_id) = self.main_id() else {
+                        return Task::none();
+                    };
+                    window::mode(main_id).map(Message::GotMode)
+                }
+                Character("j") => {
+                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
+                        self.last_seek_time = Instant::now();
+                        self.player.seek_rel(-10000);
+                    }
+                    Task::none()
+                }
+                Character("l") => {
+                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
+                        self.last_seek_time = Instant::now();
+                        self.player.seek_rel(10000);
+                    }
+                    Task::none()
+                }
+                Character("r") => {
+                    if modifiers.shift() {
+                        self.eof_loop = !self.eof_loop;
+                        self.set_text(format!("Loop: {}", self.eof_loop), Duration::from_secs(2))
+                    } else {
+                        // TODO handle ab looping
+                        Task::none()
+                    }
+                }
+                Character("t") => {
+                    if let Some(ms) = self.player.position_ms() {
+                        let total_second = ms / 1000;
+                        let second = total_second % 60;
+                        let minute = (total_second / 60) % 60;
+                        let hour = total_second / 3600;
+                        let text = format!("{hour:02}:{minute:02}:{second:02}");
+                        self.set_text(text, Duration::from_secs(2))
+                    } else {
+                        Task::none()
+                    }
+                }
+                _ => Task::none(),
+            }
+        } else {
+            Task::none()
+        }
+    }
+
+    fn adjust_volume(&mut self, change: f32) -> Task<Message> {
+        let channel1_vol = self.player.modify_volumes(|v| (v + change).clamp(0.0, 1.5));
+        let text = format!("Volume {}%", (channel1_vol * 100.0).round() as u32);
+        self.set_text(text, Duration::from_secs(2))
     }
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
@@ -250,7 +297,11 @@ impl App {
                 .on_enter(Message::VideoHovered(true))
                 .on_exit(Message::VideoHovered(false))
                 .on_scroll(Message::Scroll)
-                .on_press(Message::KeyPressed(keyboard::Key::Named(Named::Space))); // Not ideal but I don't want to create another message when keypressed space is fine
+                .on_press(Message::KeyPressed(
+                    Key::Named(iced::keyboard::key::Named::Space),
+                    Modifiers::NONE,
+                )); // Not ideal but I don't want to create another message when keypressed space is fine
+
             if let Some(top_text) = &self.text {
                 let message = container(text(top_text).size(25))
                     .width(Length::Fill)

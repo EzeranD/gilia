@@ -1,6 +1,6 @@
 use tracing::debug;
 
-use crate::engine::PlayerChannels;
+use crate::{ExternalEvent, engine::PlayerChannels};
 
 type Pts = i64;
 
@@ -124,8 +124,9 @@ pub struct PlayerCore {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackMode {
-    Paused,
     Playing,
+    Paused,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -258,15 +259,24 @@ impl PlayerCore {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     draining.video = TrackDrainState::OutputDrained;
                     if draining.is_drained(&self.streams) {
+                        self.mode = PlaybackMode::Stopped;
                         self.phase = PlaybackPhase::Eof;
+                        if let Some(cb) = &dispatch.external_callback {
+                            cb(ExternalEvent::Eof);
+                        }
                     }
                 }
             }
             PlayerEvent::SamplesDrained => {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
+                    dispatch.ab(AbEffect::Output(false));
                     draining.audio = TrackDrainState::OutputDrained;
                     if draining.is_drained(&self.streams) {
+                        self.mode = PlaybackMode::Stopped;
                         self.phase = PlaybackPhase::Eof;
+                        if let Some(cb) = &dispatch.external_callback {
+                            cb(ExternalEvent::Eof);
+                        }
                     }
                 }
             }
