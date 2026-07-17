@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use lmv_engine::{
-    EngineConfig, ExternalEvent, PlaybackMode, PlaybackPhase, PlayerEngine, PlayerEvent,
+    ControlEvent::{ChangeVolumes, Pause, Play, Seek},
+    EngineConfig, ExternalEvent, PlaybackMode, PlaybackPhase, PlayerEngine,
+    PlayerEvent::Control,
 };
 use lmv_iced::widget::PlayerWidget;
 
@@ -27,11 +29,11 @@ impl Player {
     }
 
     pub fn play(&mut self) {
-        self.engine.apply_event(PlayerEvent::Play);
+        self.engine.apply_event(Control(Play));
     }
 
     pub fn pause(&mut self) {
-        self.engine.apply_event(PlayerEvent::Pause);
+        self.engine.apply_event(Control(Pause));
     }
 
     pub fn toggle_playback(&mut self) {
@@ -50,16 +52,15 @@ impl Player {
     pub fn seek_to(&mut self, pos_ms: i64) {
         let state = self.engine.state.load();
         if !matches!(state.phase, PlaybackPhase::Seeking(_)) {
-            self.engine.apply_event(PlayerEvent::Seek(pos_ms));
+            self.engine.apply_event(Control(Seek(pos_ms)));
         }
     }
 
     pub fn seek_rel(&mut self, offset_ms: i64) {
         let state = self.engine.state.load();
         if !matches!(state.phase, PlaybackPhase::Seeking(_)) {
-            self.engine.apply_event(PlayerEvent::Seek(
-                self.position_ms().unwrap_or(0) + offset_ms,
-            ));
+            self.engine
+                .apply_event(Control(Seek(self.position_ms().unwrap_or(0) + offset_ms)));
         }
     }
 
@@ -71,7 +72,7 @@ impl Player {
 
     #[allow(dead_code)]
     pub fn set_volumes(&mut self, volumes: Vec<f32>) {
-        self.engine.apply_event(PlayerEvent::ChangeVolumes(volumes));
+        self.engine.apply_event(Control(ChangeVolumes(volumes)));
     }
 
     pub fn modify_volumes(&mut self, f: impl Fn(f32) -> f32) -> f32 {
@@ -80,7 +81,7 @@ impl Player {
             *v = f(*v);
         }
         self.engine
-            .apply_event(PlayerEvent::ChangeVolumes(volumes.clone()));
+            .apply_event(Control(ChangeVolumes(volumes.clone())));
         volumes.first().copied().unwrap_or(0.0)
     }
 

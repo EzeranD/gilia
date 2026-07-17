@@ -13,7 +13,12 @@ use tracing::{debug, error};
 
 pub use crate::video::frame::{DecoderMode, VideoFrame, wrap_frame};
 use crate::{
-    core::{DecoderEffect, PlayerEvent},
+    PlayerEvent::Internal,
+    core::{
+        DecoderEffect,
+        InternalEvent::{VideoDrained, VideoFlushed, VideoSynced},
+        PlayerEvent,
+    },
     engine::EngineConfig,
     video::hw_ffmpeg::{HwOption, ManagedVideo, create_decoder, get_hw_options},
 };
@@ -112,7 +117,7 @@ impl VideoDecoder {
                     match ctx.stream.try_recv() {
                         Ok(packet) => ctx.decode(&packet, state),
                         Err(TryRecvError::Empty) => {
-                            let _ = ctx.event_tx.send(PlayerEvent::VideoDrained);
+                            let _ = ctx.event_tx.send(Internal(VideoDrained));
                             *state = VideoState::Idle;
                             debug!("State changed: {:?}", state);
                         }
@@ -251,7 +256,7 @@ impl VideoContext {
                     if let Some(decoder) = &mut self.decoder {
                         decoder.skip_frame(ffmpeg_next::Discard::Default);
                     }
-                    let _ = self.event_tx.send(PlayerEvent::VideoSynced);
+                    let _ = self.event_tx.send(Internal(VideoSynced));
                 }
             } else {
                 crossbeam_channel::select_biased! {
@@ -277,7 +282,7 @@ impl VideoContext {
 
                 self.sync_target = None;
                 decoder.skip_frame(ffmpeg_next::Discard::Default);
-                let _ = self.event_tx.send(PlayerEvent::VideoSynced);
+                let _ = self.event_tx.send(Internal(VideoSynced));
             }
         } else {
             let frame = wrap_frame(src_frame, pts, self.mode, &mut self.printed);
@@ -293,7 +298,7 @@ impl VideoContext {
                     decoder.flush();
                 }
                 *state = VideoState::Active;
-                let _ = self.event_tx.send(PlayerEvent::VideoFlushed);
+                let _ = self.event_tx.send(Internal(VideoFlushed));
             }
             DecoderEffect::Sync(pts) => {
                 self.sync_target = Some(pts);

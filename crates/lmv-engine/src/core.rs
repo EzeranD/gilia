@@ -6,10 +6,21 @@ type Pts = i64;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerEvent {
-    Pause,
+    Control(ControlEvent),
+    Internal(InternalEvent),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlEvent {
+    Open(String),
     Play,
-    ChangeVolumes(Vec<f32>),
+    Pause,
     Seek(Pts),
+    ChangeVolumes(Vec<f32>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InternalEvent {
     DemuxerSeeked,
     AudioFlushed,
     VideoFlushed,
@@ -158,21 +169,30 @@ impl PlayerCore {
             phase: self.phase,
         }
     }
+
     pub fn apply_event(&mut self, event: PlayerEvent, dispatch: &PlayerChannels) {
         debug!("Event received: {event:?}");
         match event {
-            PlayerEvent::Play => {
+            PlayerEvent::Control(event) => {
+                self.apply_control_event(event, dispatch);
+            }
+            PlayerEvent::Internal(event) => {
+                self.apply_internal_event(event, dispatch);
+            }
+        }
+    }
+    fn apply_control_event(&mut self, event: ControlEvent, dispatch: &PlayerChannels) {
+        match event {
+            ControlEvent::Open(path) => {}
+            ControlEvent::Play => {
                 self.mode = PlaybackMode::Playing;
                 dispatch.ab(AbEffect::Output(true));
             }
-            PlayerEvent::Pause => {
+            ControlEvent::Pause => {
                 self.mode = PlaybackMode::Paused;
                 dispatch.ab(AbEffect::Output(false));
             }
-            PlayerEvent::ChangeVolumes(vol) => {
-                dispatch.ab(AbEffect::ModifyVolume(vol));
-            }
-            PlayerEvent::Seek(pts) => {
+            ControlEvent::Seek(pts) => {
                 self.phase = PlaybackPhase::Seeking(SeekingState::new(pts));
                 dispatch.demuxer(DemuxerEffect::SeekDemuxer(pts));
                 dispatch.ab(AbEffect::Output(false));
@@ -181,12 +201,20 @@ impl PlayerCore {
                     clock.update(pts * 1_000_000, now);
                 }
             }
-            PlayerEvent::DemuxerSeeked => {
+            ControlEvent::ChangeVolumes(vol) => {
+                dispatch.ab(AbEffect::ModifyVolume(vol));
+            }
+        }
+    }
+
+    fn apply_internal_event(&mut self, event: InternalEvent, dispatch: &PlayerChannels) {
+        match event {
+            InternalEvent::DemuxerSeeked => {
                 dispatch.audio(DecoderEffect::Flush);
                 dispatch.video(DecoderEffect::Flush);
                 dispatch.sub(DecoderEffect::Flush);
             }
-            PlayerEvent::AudioFlushed => {
+            InternalEvent::AudioFlushed => {
                 if let PlaybackPhase::Seeking(seeking) = &mut self.phase {
                     seeking.audio = TrackSeekState::Flushed;
                     if seeking.is_flushed(&self.streams) {
@@ -197,7 +225,7 @@ impl PlayerCore {
                     }
                 }
             }
-            PlayerEvent::VideoFlushed => {
+            InternalEvent::VideoFlushed => {
                 if let PlaybackPhase::Seeking(seeking) = &mut self.phase {
                     seeking.video = TrackSeekState::Flushed;
                     if seeking.is_flushed(&self.streams) {
@@ -208,7 +236,7 @@ impl PlayerCore {
                     }
                 }
             }
-            PlayerEvent::AudioBackendFlushed => {
+            InternalEvent::AudioBackendFlushed => {
                 if let PlaybackPhase::Seeking(seeking) = &mut self.phase {
                     dispatch.demuxer(DemuxerEffect::ResumeDemuxer);
                     dispatch.audio(DecoderEffect::Sync(seeking.pts));
@@ -216,7 +244,7 @@ impl PlayerCore {
                     dispatch.sub(DecoderEffect::Sync(seeking.pts));
                 }
             }
-            PlayerEvent::AudioSynced => {
+            InternalEvent::AudioSynced => {
                 if let PlaybackPhase::Seeking(seeking) = &mut self.phase {
                     seeking.audio = TrackSeekState::Synced;
                     if seeking.is_synced(&self.streams) {
@@ -227,7 +255,7 @@ impl PlayerCore {
                     }
                 }
             }
-            PlayerEvent::VideoSynced => {
+            InternalEvent::VideoSynced => {
                 if let PlaybackPhase::Seeking(seeking) = &mut self.phase {
                     seeking.video = TrackSeekState::Synced;
                     if seeking.is_synced(&self.streams) {
@@ -238,24 +266,24 @@ impl PlayerCore {
                     }
                 }
             }
-            PlayerEvent::DemuxerEof => {
+            InternalEvent::DemuxerEof => {
                 self.phase = PlaybackPhase::Draining(DrainingState::new());
                 dispatch.audio(DecoderEffect::Drain);
                 dispatch.video(DecoderEffect::Drain);
             }
-            PlayerEvent::AudioDrained => {
+            InternalEvent::AudioDrained => {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     draining.audio = TrackDrainState::DecoderDrained;
                 }
                 dispatch.ab(AbEffect::DrainOutput);
             }
-            PlayerEvent::VideoDrained => {
+            InternalEvent::VideoDrained => {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     draining.video = TrackDrainState::DecoderDrained;
                 }
                 dispatch.ab(AbEffect::DrainOutput);
             }
-            PlayerEvent::FramesDrained => {
+            InternalEvent::FramesDrained => {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     draining.video = TrackDrainState::OutputDrained;
                     if draining.is_drained(&self.streams) {
@@ -267,7 +295,7 @@ impl PlayerCore {
                     }
                 }
             }
-            PlayerEvent::SamplesDrained => {
+            InternalEvent::SamplesDrained => {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     dispatch.ab(AbEffect::Output(false));
                     draining.audio = TrackDrainState::OutputDrained;

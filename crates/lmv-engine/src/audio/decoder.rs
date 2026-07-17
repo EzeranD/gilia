@@ -11,8 +11,13 @@ use ffmpeg_next::{
 use tracing::{debug, error};
 
 use crate::{
+    PlayerEvent::Internal,
     audio::queue::{AudioBlock, Producer, PushError},
-    core::{DecoderEffect, PlayerEvent},
+    core::{
+        DecoderEffect,
+        InternalEvent::{AudioDrained, AudioFlushed, AudioSynced},
+        PlayerEvent,
+    },
 };
 
 pub struct AudioDecoder {
@@ -83,7 +88,7 @@ impl AudioDecoder {
                     match self.stream.try_recv() {
                         Ok(packet) => self.decode(&packet),
                         Err(TryRecvError::Empty) => {
-                            let _ = self.event_tx.send(PlayerEvent::AudioDrained);
+                            let _ = self.event_tx.send(Internal(AudioDrained));
                             self.state = DecoderState::Idle;
                             debug!("State changed: {:?}", self.state);
                         }
@@ -151,7 +156,7 @@ impl AudioDecoder {
                     thread::park();
                 }
                 self.sync_target = None;
-                let _ = self.event_tx.send(PlayerEvent::AudioSynced);
+                let _ = self.event_tx.send(Internal(AudioSynced));
             } else {
                 loop {
                     match self.effect_rx.try_recv() {
@@ -180,7 +185,7 @@ impl AudioDecoder {
                 while self.stream.try_recv().is_ok() {}
                 self.decoder.flush();
                 self.state = DecoderState::Active;
-                let _ = self.event_tx.send(PlayerEvent::AudioFlushed);
+                let _ = self.event_tx.send(Internal(AudioFlushed));
             }
             DecoderEffect::Sync(pts) => {
                 self.sync_target = Some(pts);

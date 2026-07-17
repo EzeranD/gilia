@@ -6,7 +6,7 @@ mod subtitle;
 mod sync;
 mod video;
 
-pub use core::{PlaybackMode, PlaybackPhase, PlayerEvent};
+pub use core::{ControlEvent, PlaybackMode, PlaybackPhase, PlayerEvent};
 
 pub use engine::{EngineConfig, ExternalEvent, PlayerEngine};
 pub use subtitle::decoder::SubtitleFrame;

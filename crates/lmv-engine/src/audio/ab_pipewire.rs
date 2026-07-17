@@ -26,8 +26,13 @@ use pipewire::{
 use tracing::warn;
 
 use crate::{
+    PlayerEvent::Internal,
     audio::queue::Consumer,
-    core::{AbEffect, PlayerEvent},
+    core::{
+        AbEffect,
+        InternalEvent::{AudioBackendFlushed, SamplesDrained},
+        PlayerEvent,
+    },
     engine::{ExternalCallback, ExternalEvent, get_engine_start},
     sync::Clock,
 };
@@ -110,7 +115,7 @@ pub fn spawn(
                         pw_audio_buffer.clear();
                     }
                     recv_stream.flush(false).unwrap();
-                    let _ = ab_event_tx.send(PlayerEvent::AudioBackendFlushed);
+                    let _ = ab_event_tx.send(Internal(AudioBackendFlushed));
                 }
                 AbEffect::DrainOutput => {
                     recv_drain.store(true, Ordering::Relaxed);
@@ -169,7 +174,7 @@ pub fn spawn(
                         *chunk.size_mut() = (filled * audio_buffer.stride) as u32;
                     } else {
                         if drain_flag.load(Ordering::Relaxed) {
-                            let _ = pw_event_tx.send(PlayerEvent::SamplesDrained);
+                            let _ = pw_event_tx.send(Internal(SamplesDrained));
                             drain_flag.store(false, Ordering::Relaxed);
                         }
                         let chunk = data.chunk_mut();

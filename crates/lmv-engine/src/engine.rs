@@ -23,14 +23,15 @@ use libass::{OverrideBits, Style};
 use tracing::{debug, error};
 
 use crate::{
+    PlayerEvent::Internal,
     audio::{
         self,
         decoder::AudioDecoder,
         queue::{ThreadWaker, WakingSender, channel, queue},
     },
     core::{
-        AbEffect, ActiveStreams, DecoderEffect, DemuxerEffect, PlaybackMode, PlaybackPhase,
-        PlayerCore, PlayerEvent, PlayerSnapshot,
+        AbEffect, ActiveStreams, DecoderEffect, DemuxerEffect, InternalEvent::FramesDrained,
+        PlaybackMode, PlaybackPhase, PlayerCore, PlayerEvent, PlayerSnapshot,
     },
     demuxer::Demuxer,
     subtitle::decoder::{SubtitleDecoder, SubtitleFrame},
@@ -395,7 +396,7 @@ impl PlayerEngine {
                     Ok(f) => f,
                     Err(TryRecvError::Empty) => {
                         if matches!(self.state.load().phase, PlaybackPhase::Draining(_)) {
-                            self.apply_event(PlayerEvent::FramesDrained);
+                            self.apply_event(Internal(FramesDrained));
                             return (false, 1);
                         }
                         return (false, 1);
@@ -423,7 +424,7 @@ impl PlayerEngine {
                     }
                     Err(TryRecvError::Empty) => {
                         if self.video_output.drain.load(Ordering::Relaxed) {
-                            self.apply_event(PlayerEvent::FramesDrained);
+                            self.apply_event(Internal(FramesDrained));
                             return (false, 1);
                         }
                         return (false, 1);
@@ -440,7 +441,7 @@ impl PlayerEngine {
                     Ok(f) => f,
                     Err(TryRecvError::Empty) => {
                         if self.video_output.drain.load(Ordering::Relaxed) {
-                            self.apply_event(PlayerEvent::FramesDrained);
+                            self.apply_event(Internal(FramesDrained));
                             return (false, 1);
                         }
                         return (false, 1);

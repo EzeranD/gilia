@@ -1,9 +1,12 @@
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next::{Packet, Rescale, format::context::Input};
 
-use crate::core::{
-    DemuxerEffect,
-    PlayerEvent::{self, DemuxerEof},
+use crate::{
+    PlayerEvent::{self, Internal},
+    core::{
+        DemuxerEffect,
+        InternalEvent::{DemuxerEof, DemuxerSeeked},
+    },
 };
 
 pub struct Demuxer {
@@ -101,7 +104,7 @@ impl Demuxer {
                         }
                     }
                     Err(ffmpeg_next::Error::Eof) => {
-                        let _ = self.event_tx.send(DemuxerEof);
+                        let _ = self.event_tx.send(Internal(DemuxerEof));
                         if let Ok(effect) = self.effect_rx.recv() {
                             self.effect_recv(effect);
                         }
@@ -119,7 +122,7 @@ impl Demuxer {
         if let DemuxerEffect::SeekDemuxer(pts) = effect {
             let pts_us = pts * 1000;
             let _ = self.ictx.seek(pts_us, i64::MIN..pts_us);
-            let _ = self.event_tx.send(PlayerEvent::DemuxerSeeked);
+            let _ = self.event_tx.send(Internal(DemuxerSeeked));
             if let Ok(DemuxerEffect::ResumeDemuxer) = self.effect_rx.recv() {}
         }
     }
