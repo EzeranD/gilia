@@ -1,8 +1,4 @@
-use core::slice;
 use std::{
-    cell::RefCell,
-    ffi::CString,
-    path::Path,
     sync::{Arc, LazyLock, Mutex, atomic::AtomicI64},
     thread,
     time::Instant,
@@ -12,24 +8,22 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::Sender;
 use ffmpeg_next::{
     Packet, Stream,
-    codec::Context,
     format::{context::Input, input},
     media::Type,
 };
-use libass::{OverrideBits, Style};
 use tracing::error;
 
 use crate::{
-    audio::{self, decoder::AudioDecoder, queue::queue},
+    audio::spawn_audio_stream,
     core::{
         AbEffect, ActiveStreams, DecoderEffect, DemuxerEffect, PlaybackMode, PlaybackPhase,
         PlayerCore, PlayerEvent, PlayerSnapshot, VoEffect,
     },
     demuxer::Demuxer,
-    subtitle::decoder::{SubtitleDecoder, SubtitleFrame},
+    subtitle::{decoder::SubtitleFrame, spawn_sub_stream},
     sync::Clock,
-    utils::{ThreadWaker, WakingSender, channel},
-    video::{decoder::VideoDecoder, frame::VideoFrame, output::VideoOutput},
+    utils::WakingSender,
+    video::{frame::VideoFrame, spawn_video_stream},
 };
 
 static ENGINE_START: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -75,7 +69,7 @@ pub struct AudioInfo {
 }
 
 struct SubOutput {
-    renderer: Option<RefCell<libass::Renderer>>,
+    renderer: Option<Arc<Mutex<libass::Renderer>>>,
     track: Option<Arc<Mutex<libass::Track>>>,
 }
 
@@ -121,212 +115,45 @@ impl PlayerEngine {
 
         if let Some(audio_stream) = audio_stream {
             audio_idx = Some(audio_stream.1);
-
-            let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::bounded(50);
-            let (pw_tx, pw_rx) = pipewire::channel::channel();
-
-            channels.audio_packet_tx = Some(audio_packet_tx);
-            channels.pw_tx = Some(pw_tx);
-
-            let audio_clock = Arc::new(Clock::default());
-            channels.audio_clock = Some(audio_clock.clone());
-            self.audio_info.audio_clock = Some(audio_clock.clone());
-
-            let audio_context = Context::from_parameters(audio_stream.0.parameters()).unwrap();
-            let audio_time_base = audio_stream.0.time_base();
-            let decoder = audio_context.decoder().audio().unwrap();
-            let audio_rate = decoder.rate();
-            let waker = Arc::new(ThreadWaker::new());
-            let (audio_tx, audio_rx) = channel(waker.clone());
-            channels.audio_tx = Some(audio_tx);
-            let (audio_buffer_tx, audio_buffer_rx) = queue(128, waker.clone());
-            let audio_event_tx = event_tx.clone();
-            let decoder_waker = waker.clone();
-            std::thread::Builder::new()
-                .name("audio-decoder".into())
-                .spawn(move || {
-                    decoder_waker.set();
-                    let mut audio_decoder = AudioDecoder::new(
-                        decoder,
-                        audio_packet_rx,
-                        audio_buffer_tx,
-                        audio_time_base,
-                        audio_rx,
-                        audio_event_tx,
-                    );
-                    audio_decoder.process();
-                })
-                .unwrap();
-            let ab_event_tx = event_tx.clone();
-            audio::ab_pipewire::spawn(
-                audio_buffer_rx,
-                pw_rx,
-                ab_event_tx,
-                audio_rate,
-                audio_clock.clone(),
-                self.audio_info.volume.clone(),
-                self.external_callback.clone(),
+            let (dec_effect_tx, pw_tx, packet_tx, clock) = spawn_audio_stream(
+                &audio_stream,
+                &event_tx,
+                self.external_callback.as_ref(),
+                &self.audio_info.volume,
                 path,
             );
+
+            channels.audio_tx = Some(dec_effect_tx);
+            channels.pw_tx = Some(pw_tx);
+            channels.audio_packet_tx = Some(packet_tx);
+            channels.audio_clock = Some(clock.clone());
+            self.audio_info.audio_clock = Some(clock);
         }
 
         if let Some(video_stream) = video_stream {
             video_idx = Some(video_stream.1);
-            let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
-            let (video_tx, video_rx) = crossbeam_channel::unbounded();
-            let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded(3);
-
-            channels.video_tx = Some(video_tx);
-            channels.video_packet_tx = Some(video_packet_tx);
-
-            let config = self.config.clone();
-            let video_time_base = video_stream.0.time_base();
-            let parameters = video_stream.0.parameters();
-            let video_event_tx = event_tx.clone();
-            std::thread::Builder::new()
-                .name("video-decoder".into())
-                .spawn(move || {
-                    let mut decoder = VideoDecoder::new(
-                        config,
-                        parameters,
-                        video_packet_rx,
-                        frame_tx,
-                        video_time_base,
-                        video_rx,
-                        video_event_tx,
-                    );
-                    decoder.process();
-                })
-                .unwrap();
-
-            let waker = Arc::new(ThreadWaker::new());
-            let (vp_tx, vp_rx) = crossbeam_channel::unbounded();
-            let sender = WakingSender::new(vp_tx, waker.clone());
-            channels.video_playback_tx = Some(sender);
-
-            let mut tick_scheduler = VideoOutput::new(
-                self.audio_info.audio_clock.clone(),
-                frame_rx.clone(),
-                self.frame.clone(),
-                self.current_pts.clone(),
-                vp_rx,
-                event_tx.clone(),
-                self.external_callback.clone(),
+            let (dec_tx, vo_tx, packet_tx) = spawn_video_stream(
+                &video_stream,
+                &event_tx,
+                self.external_callback.as_ref(),
+                &self.config,
+                &self.frame,
+                &self.current_pts,
+                self.audio_info.audio_clock.as_ref(),
             );
-            std::thread::spawn(move || {
-                waker.set();
-                tick_scheduler.process();
-            });
+            channels.video_tx = Some(dec_tx);
+            channels.video_output_tx = Some(vo_tx);
+            channels.video_packet_tx = Some(packet_tx);
         }
 
         if let Some(sub_stream) = sub_stream {
             sub_idx = Some(sub_stream.1);
-            let sub_context = Context::from_parameters(sub_stream.0.parameters()).unwrap();
-            let mut lib = libass::Library::new().unwrap();
-            for stream in ictx.streams() {
-                if stream.parameters().medium() == Type::Attachment {
-                    let metadata = stream.metadata();
-                    let Some(filename) = metadata.get("filename") else {
-                        continue;
-                    };
-                    let lower = filename.to_lowercase();
-                    let ext = Path::new(&lower).extension();
-                    if matches!(
-                        ext.and_then(|e| e.to_str()),
-                        Some("ttf" | "otf" | "ttc" | "otc" | "pfb" | "pfm")
-                    ) {
-                        let attach_context = Context::from_parameters(stream.parameters()).unwrap();
-                        unsafe {
-                            let ptr = attach_context.as_ptr();
-                            if !(*ptr).extradata.is_null() && (*ptr).extradata_size > 0 {
-                                let data = slice::from_raw_parts(
-                                    (*ptr).extradata,
-                                    (*ptr).extradata_size as usize,
-                                );
-                                lib.add_font(filename, data);
-                            }
-                        }
-                    }
-                }
-            }
-            let mut renderer = libass::Renderer::new(&mut lib).unwrap();
-            renderer.set_margins(0, 0, 0, 0);
-            renderer.use_margins(false);
-            renderer.set_fonts(
-                None,
-                "sans-serif",
-                libass::DefaultFontProvider::Autodetect,
-                None,
-                true,
-            );
-            let mut track = lib.new_track().unwrap();
-            unsafe {
-                let ptr = sub_context.as_ptr();
-                if !(*ptr).extradata.is_null() && (*ptr).extradata_size > 0 {
-                    let data =
-                        slice::from_raw_parts((*ptr).extradata, (*ptr).extradata_size as usize);
-                    track.process_codec_private(data);
-                } else {
-                    let header = "\
-                    [Events]\n\
-                    Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
-                    track.process_codec_private(header.as_bytes());
-
-                    renderer.set_selective_style_override(&Style {
-                        name: CString::new("Default").unwrap(),
-                        font_name: CString::new("Ghandi Sans").unwrap(),
-                        font_size: 15.0,
-                        primary_color: 0xFFFF_FF00,
-                        secondary_color: 0xFFFF_FF00,
-                        outline_color: 0x0000_0000,
-                        back_color: 0x0000_0000,
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                        strikeout: false,
-                        scale_x: 1.0,
-                        scale_y: 1.0,
-                        spacing: 0.0,
-                        angle: 0.0,
-                        border_style: 1,
-                        outline: 1.0,
-                        shadow: 0.0,
-                        alignment: 2,
-                        margin_l: 10,
-                        margin_r: 10,
-                        margin_v: 10,
-                        encoding: 1,
-                        treat_fontname_as_pattern: true,
-                        blur: 0.0,
-                        justify: 0,
-                    });
-                    renderer.set_selective_style_override_enabled(OverrideBits::FULL_STYLE);
-                }
-            }
-            let sub_time_base = sub_stream.0.time_base();
-            let shared_track = Arc::new(Mutex::new(track));
-            self.sub_output.track = Some(shared_track.clone());
-            self.sub_output.renderer = Some(RefCell::new(renderer));
-            let sub_track = shared_track.clone();
-            let (sub_packet_tx, sub_packet_rx) = crossbeam_channel::bounded(50);
-            let (sub_tx, sub_rx) = crossbeam_channel::unbounded();
+            let (sub_tx, packet_tx, track, renderer) =
+                spawn_sub_stream(&ictx, &event_tx, sub_stream);
             channels.sub_tx = Some(sub_tx);
-            channels.sub_packet_tx = Some(sub_packet_tx);
-            let sub_event_tx = event_tx.clone();
-            std::thread::Builder::new()
-                .name("sub-decoder".into())
-                .spawn(move || {
-                    let mut sub_decoder = SubtitleDecoder::new(
-                        sub_context,
-                        sub_packet_rx,
-                        sub_track,
-                        sub_time_base,
-                        sub_rx,
-                        sub_event_tx,
-                    );
-                    sub_decoder.process();
-                })
-                .unwrap();
+            channels.sub_packet_tx = Some(packet_tx);
+            self.sub_output.track = Some(track);
+            self.sub_output.renderer = Some(Arc::new(Mutex::new(renderer)));
         }
 
         let demuxer_event_tx = event_tx.clone();
@@ -393,7 +220,7 @@ impl PlayerEngine {
                 (widget_width - scaled.0) / 2.0,
                 (widget_height - scaled.1) / 2.0,
             );
-            let mut renderer = renderer.borrow_mut();
+            let mut renderer = renderer.lock().unwrap();
             renderer.set_frame_size(widget_width as i32, widget_height as i32);
             renderer.set_margins(
                 margin.1 as i32,
@@ -409,7 +236,7 @@ impl PlayerEngine {
         else {
             return None;
         };
-        let mut renderer = renderer.borrow_mut();
+        let mut renderer = renderer.lock().unwrap();
         let (images, change) = renderer.render_frame(&mut track.lock().unwrap(), frame_pts);
         Some(SubtitleFrame {
             layers: images.into_iter().flatten().collect(),
@@ -436,7 +263,7 @@ pub struct PlayerChannels {
     pub pw_tx: Option<pipewire::channel::Sender<AbEffect>>,
     pub video_tx: Option<Sender<DecoderEffect>>,
     pub video_packet_tx: Option<Sender<Packet>>,
-    pub video_playback_tx: Option<WakingSender<VoEffect>>,
+    pub video_output_tx: Option<WakingSender<VoEffect>>,
     pub sub_tx: Option<Sender<DecoderEffect>>,
     pub sub_packet_tx: Option<Sender<Packet>>,
     pub external_callback: Option<ExternalCallback>,
@@ -450,7 +277,7 @@ impl PlayerChannels {
             audio_tx: None,
             audio_packet_tx: None,
             pw_tx: None,
-            video_playback_tx: None,
+            video_output_tx: None,
             video_tx: None,
             video_packet_tx: None,
             sub_tx: None,
@@ -486,7 +313,7 @@ impl PlayerChannels {
         }
     }
     pub fn vp(&self, effect: VoEffect) {
-        if let Some(tx) = &self.video_playback_tx {
+        if let Some(tx) = &self.video_output_tx {
             let _ = tx.send(effect);
         }
     }

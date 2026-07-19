@@ -1,10 +1,8 @@
-use std::time::{Duration, Instant};
-
 use iced::{
     Element, Event, Length, Rectangle, Size,
     advanced::{Layout, Shell, Widget, layout, mouse, renderer, widget::Tree},
 };
-use lmv_engine::{PlaybackMode, PlayerEngine};
+use lmv_engine::PlayerEngine;
 
 use crate::{subs::SubPrimitive, video::VideoPrimitive};
 
