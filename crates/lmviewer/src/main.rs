@@ -182,6 +182,7 @@ impl App {
                 }
                 Task::none()
             }
+            Message::CallbackEvent(ExternalEvent::NewFrame) => Task::none(),
             Message::ClearText(id) => {
                 if self.text_id == id {
                     self.text = None;

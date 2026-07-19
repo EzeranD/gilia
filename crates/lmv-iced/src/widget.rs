@@ -12,8 +12,6 @@ pub struct PlayerWidget<'a> {
     engine: &'a PlayerEngine,
     width: Length,
     height: Length,
-    pending_tick: bool,
-    next_tick: u64,
 }
 
 impl<'a> PlayerWidget<'a> {
@@ -22,8 +20,6 @@ impl<'a> PlayerWidget<'a> {
             engine,
             width: Length::Fill,
             height: Length::Fill,
-            pending_tick: true,
-            next_tick: 10,
         }
     }
 
@@ -72,39 +68,13 @@ where
     fn update(
         &mut self,
         _tree: &mut Tree,
-        event: &Event,
+        _event: &Event,
         _layout: Layout<'_>,
         _cursor: mouse::Cursor,
         _renderer: &Renderer,
-        shell: &mut Shell<'_, Message>,
+        _shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        let state = self.engine.state.load();
-        let playing = state.mode == PlaybackMode::Playing;
-        let redraw_requested = matches!(
-            event,
-            Event::Window(iced::window::Event::RedrawRequested(_))
-        );
-
-        if !playing {
-            self.pending_tick = false;
-            return;
-        }
-
-        if playing && !self.pending_tick {
-            self.pending_tick = true;
-            shell.request_redraw_at(Instant::now() + Duration::from_millis(1));
-            return;
-        }
-
-        if redraw_requested && self.pending_tick {
-            self.pending_tick = false;
-            let (_new_frame, next_tick_ms) = self.engine.tick_playback();
-            self.next_tick = next_tick_ms;
-            let next_redraw = Instant::now() + Duration::from_millis(next_tick_ms);
-            shell.request_redraw_at(next_redraw);
-            self.pending_tick = true;
-        }
     }
 
     fn draw(
@@ -121,7 +91,10 @@ where
             let frame_pts = frame.info.pts.unwrap();
             let width = frame.info.width;
             let height = frame.info.height;
-            renderer.draw_primitive(layout.bounds(), VideoPrimitive::new(frame));
+            renderer.draw_primitive(
+                layout.bounds(),
+                VideoPrimitive::new(frame, self.engine.current_pts.clone()),
+            );
             self.engine.update_viewport(
                 layout.bounds().width,
                 layout.bounds().height,

@@ -4,6 +4,7 @@ mod demuxer;
 mod engine;
 mod subtitle;
 mod sync;
+mod utils;
 mod video;
 
 pub use core::{ControlEvent, PlaybackMode, PlaybackPhase, PlayerEvent};

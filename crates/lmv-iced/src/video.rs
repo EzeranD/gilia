@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
+
 use ash::vk::Handle;
 use ffmpeg_next::format::Pixel;
 use iced::{
@@ -22,11 +27,12 @@ use crate::widget::{VideoUniform, compute_scale};
 #[derive(Debug)]
 pub struct VideoPrimitive {
     pub frame: VideoFrame,
+    pub current_pts: Arc<AtomicI64>,
 }
 
 impl VideoPrimitive {
-    pub fn new(frame: VideoFrame) -> Self {
-        Self { frame }
+    pub fn new(frame: VideoFrame, current_pts: Arc<AtomicI64>) -> Self {
+        Self { frame, current_pts }
     }
 
     fn handle_format(
@@ -419,10 +425,16 @@ impl shader::Primitive for VideoPrimitive {
         bounds: &iced::Rectangle,
         _viewport: &shader::Viewport,
     ) {
+        let current_pts = self.current_pts.load(Ordering::Relaxed);
         let resolution_changed =
             pipeline.width != self.frame.info.width || pipeline.height != self.frame.info.height;
         let bounds_changed = pipeline.bound_width != bounds.width as u32
             || pipeline.bound_height != bounds.height as u32;
+        if pipeline.last_pts == Some(current_pts) && !resolution_changed && !bounds_changed {
+            return;
+        }
+        pipeline.last_pts = Some(current_pts);
+
         if resolution_changed {
             pipeline.width = self.frame.info.width;
             pipeline.height = self.frame.info.height;
@@ -578,6 +590,7 @@ pub struct VideoPipeline {
     height: u32,
     bound_width: u32,
     bound_height: u32,
+    last_pts: Option<i64>,
 }
 
 impl VideoPipeline {
@@ -685,6 +698,7 @@ impl VideoPipeline {
             height: 0,
             bound_width: 0,
             bound_height: 0,
+            last_pts: None,
         }
     }
 }

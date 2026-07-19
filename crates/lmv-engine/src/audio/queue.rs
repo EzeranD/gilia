@@ -11,7 +11,7 @@ use std::{
 use crossbeam_channel::{Receiver, SendError, Sender};
 use crossbeam_utils::CachePadded;
 
-use crate::core::DecoderEffect;
+use crate::utils::ThreadWaker;
 
 #[derive(Debug)]
 pub struct AudioBlock {
@@ -28,15 +28,6 @@ pub struct Consumer {
 }
 
 pub struct Producer(Arc<AudioQueue>);
-
-pub struct WakingSender {
-    tx: Sender<DecoderEffect>,
-    waker: Arc<ThreadWaker>,
-}
-
-pub struct ThreadWaker {
-    thread: OnceLock<Thread>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
@@ -62,11 +53,6 @@ pub fn queue(capacity: usize, waker: Arc<ThreadWaker>) -> (Producer, Consumer) {
             block_pos: Arc::new(AtomicUsize::new(0)),
         },
     )
-}
-
-pub fn channel(waker: Arc<ThreadWaker>) -> (WakingSender, Receiver<DecoderEffect>) {
-    let (tx, rx) = crossbeam_channel::unbounded();
-    (WakingSender::new(tx, waker), rx)
 }
 
 impl Consumer {
@@ -190,36 +176,6 @@ impl Producer {
             }
             self.0.write.store(write.wrapping_add(1), Ordering::Release);
             Ok(())
-        }
-    }
-}
-
-impl WakingSender {
-    pub fn new(tx: Sender<DecoderEffect>, waker: Arc<ThreadWaker>) -> Self {
-        Self { tx, waker }
-    }
-
-    pub fn send(&self, msg: DecoderEffect) -> Result<(), SendError<DecoderEffect>> {
-        self.tx.send(msg)?;
-        self.waker.unpark();
-        Ok(())
-    }
-}
-
-impl ThreadWaker {
-    pub fn new() -> Self {
-        Self {
-            thread: OnceLock::new(),
-        }
-    }
-    pub fn set(&self) {
-        self.thread
-            .set(thread::current())
-            .expect("Thread set twice");
-    }
-    pub fn unpark(&self) {
-        if let Some(thread) = self.thread.get() {
-            thread.unpark();
         }
     }
 }
