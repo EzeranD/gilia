@@ -9,12 +9,12 @@ use ffmpeg_next::{
 use libass::{Change, Layer};
 use tracing::warn;
 
-use crate::core::{DecoderEffect, PlayerEvent};
+use crate::session::{DecoderEffect, PlayerEvent};
 
 pub struct SubtitleDecoder {
     decoder: Subtitle,
     stream: Receiver<Packet>,
-    track: Arc<Mutex<libass::Track>>,
+    track: Arc<Mutex<Option<libass::Track>>>,
     effect_rx: Receiver<DecoderEffect>,
     event_tx: Sender<PlayerEvent>,
     time_base: Rational,
@@ -30,7 +30,7 @@ impl SubtitleDecoder {
     pub fn new(
         context: Context,
         stream: Receiver<Packet>,
-        track: Arc<Mutex<libass::Track>>,
+        track: Arc<Mutex<Option<libass::Track>>>,
         time_base: Rational,
         effect_rx: Receiver<DecoderEffect>,
         event_tx: Sender<PlayerEvent>,
@@ -62,8 +62,9 @@ impl SubtitleDecoder {
             match self.decoder.id() {
                 Id::ASS | Id::SSA => {
                     if let Some(data) = packet.data() {
-                        let mut track = self.track.lock().unwrap();
-                        track.process_chunk(data, pts.unwrap(), duration);
+                        if let Some(track) = &mut *self.track.lock().unwrap() {
+                            track.process_chunk(data, pts.unwrap(), duration);
+                        }
                     }
                 }
                 Id::SUBRIP | Id::WEBVTT | Id::MOV_TEXT | Id::TEXT => {
@@ -80,8 +81,13 @@ impl SubtitleDecoder {
                                 warn!("Text subs are not supported");
                             }
                             ffmpeg_next::subtitle::Rect::Ass(ass) => {
-                                let mut track = self.track.lock().unwrap();
-                                track.process_chunk(ass.get().as_bytes(), pts.unwrap(), duration);
+                                if let Some(track) = &mut *self.track.lock().unwrap() {
+                                    track.process_chunk(
+                                        ass.get().as_bytes(),
+                                        pts.unwrap(),
+                                        duration,
+                                    );
+                                }
                             }
                         }
                     }
@@ -97,7 +103,9 @@ impl SubtitleDecoder {
             DecoderEffect::Flush => {
                 while self.stream.try_recv().is_ok() {}
                 self.decoder.flush();
-                self.track.lock().unwrap().flush_events();
+                if let Some(track) = &mut *self.track.lock().unwrap() {
+                    track.flush_events();
+                }
             }
             // TODO work on these when we dont use libass for everything for now it doesnt hurt having these do nothing
             DecoderEffect::Sync(_) | DecoderEffect::Drain => {}

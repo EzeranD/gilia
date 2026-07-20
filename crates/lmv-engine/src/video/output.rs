@@ -13,18 +13,18 @@ use crate::{
     ExternalEvent,
     PlayerEvent::{self, Internal},
     VideoFrame,
-    core::{
+    engine::ExternalCallback,
+    session::{
         InternalEvent::{FramesDrained, VideoOutputFlushed},
         VoEffect,
     },
-    engine::ExternalCallback,
-    sync::Clock,
+    utils::Clock,
 };
 
 const THRESHOLD: i64 = 20;
 
 pub struct VideoOutput {
-    audio_clock: Option<Arc<Clock>>,
+    audio_clock: Arc<Clock>,
     frame_rx: Receiver<VideoFrame>,
     frame: Arc<Mutex<Option<VideoFrame>>>,
     current_pts: Arc<AtomicI64>,
@@ -50,7 +50,7 @@ enum PresentResult {
 
 impl VideoOutput {
     pub fn new(
-        audio_clock: Option<Arc<Clock>>,
+        audio_clock: Arc<Clock>,
         frame_rx: Receiver<VideoFrame>,
         frame: Arc<Mutex<Option<VideoFrame>>>,
         current_pts: Arc<AtomicI64>,
@@ -99,11 +99,11 @@ impl VideoOutput {
     }
 
     fn present_next(&mut self) -> PresentResult {
-        let Some(audio_clock) = &self.audio_clock else {
+        if !self.audio_clock.active.load(Ordering::Relaxed) {
             return PresentResult::Disconnected; // TODO later we wont rely on the audio for video only files
-        };
+        }
 
-        let audio_ms = audio_clock.get_ms();
+        let audio_ms = self.audio_clock.get_ms();
         let mut current_frame = {
             if let Some(f) = self.next_frame.take() {
                 f

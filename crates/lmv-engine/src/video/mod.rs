@@ -1,14 +1,16 @@
-use std::sync::{Arc, Mutex, atomic::AtomicI64};
+use std::{
+    sync::{Arc, Mutex, atomic::AtomicI64},
+    thread::JoinHandle,
+};
 
 use crossbeam_channel::Sender;
 use ffmpeg_next::{Packet, Stream};
 
 use crate::{
     EngineConfig, PlayerEvent, VideoFrame,
-    core::{DecoderEffect, VoEffect},
     engine::ExternalCallback,
-    sync::Clock,
-    utils::{ThreadWaker, WakingSender},
+    session::{DecoderEffect, VoEffect},
+    utils::{Clock, ThreadWaker, WakingSender},
     video::{decoder::VideoDecoder, output::VideoOutput},
 };
 
@@ -24,8 +26,10 @@ pub fn spawn_video_stream(
     config: &Arc<EngineConfig>,
     frame: &Arc<Mutex<Option<VideoFrame>>>,
     current_pts: &Arc<AtomicI64>,
-    audio_clock: Option<&Arc<Clock>>,
+    audio_clock: &Arc<Clock>,
 ) -> (
+    JoinHandle<()>,
+    JoinHandle<()>,
     Sender<DecoderEffect>,
     WakingSender<VoEffect>,
     Sender<Packet>,
@@ -38,7 +42,7 @@ pub fn spawn_video_stream(
     let parameters = video_stream.0.parameters();
     let video_event_tx = event_tx.clone();
     let config = config.clone();
-    std::thread::Builder::new()
+    let dec_handle = std::thread::Builder::new()
         .name("video-decoder".into())
         .spawn(move || {
             let mut decoder = VideoDecoder::new(
@@ -59,7 +63,7 @@ pub fn spawn_video_stream(
     let vo_tx = WakingSender::new(vo_tx, waker.clone());
 
     let mut tick_scheduler = VideoOutput::new(
-        audio_clock.cloned(),
+        audio_clock.clone(),
         frame_rx.clone(),
         frame.clone(),
         current_pts.clone(),
@@ -67,9 +71,9 @@ pub fn spawn_video_stream(
         event_tx.clone(),
         external_callback.cloned(),
     );
-    std::thread::spawn(move || {
+    let output_handle = std::thread::spawn(move || {
         waker.set();
         tick_scheduler.process();
     });
-    (video_tx, vo_tx, video_packet_tx)
+    (dec_handle, output_handle, video_tx, vo_tx, video_packet_tx)
 }

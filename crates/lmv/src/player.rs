@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use lmv_engine::{
     ControlEvent::{ChangeVolumes, Pause, Play, Seek},
@@ -12,13 +11,11 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(
-        path: String,
-        config: EngineConfig,
-        callback: Arc<dyn Fn(ExternalEvent) + Send + Sync>,
-    ) -> Self {
-        let mut engine = PlayerEngine::new(config);
-        engine.set_callback(callback);
+    pub fn new<F>(path: String, config: EngineConfig, callback: F) -> Self
+    where
+        F: Fn(ExternalEvent) + Send + Sync + 'static,
+    {
+        let mut engine = PlayerEngine::new(config, callback);
         let _ = engine.open(path);
         Self { engine }
     }

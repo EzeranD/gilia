@@ -28,13 +28,13 @@ use tracing::warn;
 use crate::{
     PlayerEvent::Internal,
     audio::queue::Consumer,
-    core::{
+    engine::{ExternalCallback, ExternalEvent, get_engine_start},
+    session::{
         AbEffect,
         InternalEvent::{AudioBackendFlushed, SamplesDrained},
         PlayerEvent,
     },
-    engine::{ExternalCallback, ExternalEvent, get_engine_start},
-    sync::Clock,
+    utils::Clock,
 };
 
 pub fn spawn(

@@ -3,7 +3,7 @@ use ffmpeg_next::{Packet, Rescale, format::context::Input};
 
 use crate::{
     PlayerEvent::{self, Internal},
-    core::{
+    session::{
         DemuxerEffect,
         InternalEvent::{DemuxerEof, DemuxerSeeked},
     },

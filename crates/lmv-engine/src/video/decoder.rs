@@ -14,12 +14,12 @@ use tracing::{debug, error};
 pub use crate::video::frame::{DecoderMode, VideoFrame, wrap_frame};
 use crate::{
     PlayerEvent::Internal,
-    core::{
+    engine::EngineConfig,
+    session::{
         DecoderEffect,
         InternalEvent::{VideoDrained, VideoFlushed, VideoSynced},
         PlayerEvent,
     },
-    engine::EngineConfig,
     video::hw_ffmpeg::{HwOption, ManagedVideo, create_decoder, get_hw_options},
 };
 

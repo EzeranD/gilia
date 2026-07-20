@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -97,9 +96,9 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let path = Args::parse().path;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let cb = Arc::new(move |event| {
+        let cb = move |event| {
             event_tx.send(event).ok();
-        });
+        };
         let player = Player::new(path, EngineConfig { hw_dec: true }, cb);
         let event_task = Task::stream(iced::stream::channel(
             100,
@@ -182,7 +181,9 @@ impl App {
                 }
                 Task::none()
             }
-            Message::CallbackEvent(ExternalEvent::NewFrame) => Task::none(),
+            Message::CallbackEvent(ExternalEvent::NewFrame | ExternalEvent::Error(_)) => {
+                Task::none()
+            }
             Message::ClearText(id) => {
                 if self.text_id == id {
                     self.text = None;

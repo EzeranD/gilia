@@ -3,13 +3,17 @@ use std::{
     path::Path,
     slice,
     sync::{Arc, Mutex},
+    thread::JoinHandle,
 };
 
 use crossbeam_channel::Sender;
 use ffmpeg_next::{Packet, Stream, codec::Context, format::context::Input, media::Type};
 use libass::{OverrideBits, Renderer, Style, Track};
 
-use crate::{PlayerEvent, core::DecoderEffect, subtitle::decoder::SubtitleDecoder};
+use crate::{
+    session::{DecoderEffect, PlayerEvent},
+    subtitle::decoder::SubtitleDecoder,
+};
 
 pub mod decoder;
 
@@ -17,12 +21,9 @@ pub fn spawn_sub_stream(
     ictx: &Input,
     event_tx: &Sender<PlayerEvent>,
     sub_stream: (Stream, usize),
-) -> (
-    Sender<DecoderEffect>,
-    Sender<Packet>,
-    Arc<Mutex<Track>>,
-    Renderer,
-) {
+    shared_track: Arc<Mutex<Option<Track>>>,
+    shared_renderer: Arc<Mutex<Option<Renderer>>>,
+) -> (JoinHandle<()>, Sender<DecoderEffect>, Sender<Packet>) {
     let sub_context = Context::from_parameters(sub_stream.0.parameters()).unwrap();
     let mut lib = libass::Library::new().unwrap();
     for stream in ictx.streams() {
@@ -103,12 +104,14 @@ pub fn spawn_sub_stream(
         }
     }
     let sub_time_base = sub_stream.0.time_base();
-    let shared_track = Arc::new(Mutex::new(track));
     let sub_track = shared_track.clone();
+    *shared_renderer.lock().unwrap() = Some(renderer);
+    *shared_track.lock().unwrap() = Some(track);
+
     let (sub_packet_tx, sub_packet_rx) = crossbeam_channel::bounded(50);
     let (sub_tx, sub_rx) = crossbeam_channel::unbounded();
     let sub_event_tx = event_tx.clone();
-    std::thread::Builder::new()
+    let dec_handle = std::thread::Builder::new()
         .name("sub-decoder".into())
         .spawn(move || {
             let mut sub_decoder = SubtitleDecoder::new(
@@ -122,5 +125,5 @@ pub fn spawn_sub_stream(
             sub_decoder.process();
         })
         .unwrap();
-    (sub_tx, sub_packet_tx, shared_track, renderer)
+    (dec_handle, sub_tx, sub_packet_tx)
 }

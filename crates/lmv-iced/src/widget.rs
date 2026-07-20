@@ -91,7 +91,7 @@ where
             let height = frame.info.height;
             renderer.draw_primitive(
                 layout.bounds(),
-                VideoPrimitive::new(frame, self.engine.current_pts.clone()),
+                VideoPrimitive::new(frame, self.engine.video_output.current_pts.clone()),
             );
             self.engine.update_viewport(
                 layout.bounds().width,

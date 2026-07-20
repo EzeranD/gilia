@@ -1,14 +1,14 @@
 mod audio;
-mod core;
 mod demuxer;
 mod engine;
+mod session;
 mod subtitle;
-mod sync;
 mod utils;
 mod video;
 
-pub use core::{ControlEvent, PlaybackMode, PlaybackPhase, PlayerEvent};
-
-pub use engine::{EngineConfig, ExternalEvent, PlayerEngine};
+pub use engine::{EngineConfig, ExternalEvent, PlayerEngine, SharedPlayerState};
+pub use session::{
+    ActiveStreams, ControlEvent, PlaybackMode, PlaybackPhase, PlayerEvent, PlayerThreads,
+};
 pub use subtitle::decoder::SubtitleFrame;
 pub use video::frame::{Frame, GpuFrame, VideoFrame};

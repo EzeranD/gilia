@@ -13,7 +13,7 @@ use tracing::{debug, error};
 use crate::{
     PlayerEvent::Internal,
     audio::queue::{AudioBlock, Producer, PushError},
-    core::{
+    session::{
         DecoderEffect,
         InternalEvent::{AudioDrained, AudioFlushed, AudioSynced},
         PlayerEvent,
