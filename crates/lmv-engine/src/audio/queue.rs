@@ -2,13 +2,11 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    thread::{self, Thread},
 };
 
-use crossbeam_channel::{Receiver, SendError, Sender};
 use crossbeam_utils::CachePadded;
 
 use crate::utils::ThreadWaker;

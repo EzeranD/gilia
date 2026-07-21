@@ -1,9 +1,11 @@
 use std::{
+    cell::RefCell,
     io::Cursor,
+    rc::Rc,
     slice,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -31,8 +33,8 @@ use crate::{
     engine::{ExternalCallback, ExternalEvent, get_engine_start},
     session::{
         AbEffect,
-        InternalEvent::{AudioBackendFlushed, SamplesDrained},
-        PlayerEvent,
+        InternalEvent::{Drained, Flushed},
+        PlayerEvent, Worker,
     },
     utils::Clock,
 };
@@ -44,7 +46,7 @@ pub fn spawn(
     rate: u32,
     audio_clock: Arc<Clock>,
     audio_volume: Arc<Mutex<Vec<f32>>>,
-    callback: Option<ExternalCallback>,
+    callback: ExternalCallback,
     path: String,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -65,31 +67,18 @@ pub fn spawn(
             },
         )
         .unwrap();
-        let mut audioinfo = AudioInfoRaw::new();
-        audioinfo.set_channels(2);
-        audioinfo.set_format(AudioFormat::F32LE);
-        audioinfo.set_rate(rate);
-        let mut position = [0; spa::param::audio::MAX_CHANNELS];
-        position[0] = libspa_sys::SPA_AUDIO_CHANNEL_FL;
-        position[1] = libspa_sys::SPA_AUDIO_CHANNEL_FR;
-        audioinfo.set_position(position);
-        let values = PodSerializer::serialize(
-            Cursor::new(Vec::new()),
-            &spa::pod::Value::Object(Object {
-                type_: libspa_sys::SPA_TYPE_OBJECT_Format,
-                id: libspa_sys::SPA_PARAM_EnumFormat,
-                properties: audioinfo.into(),
-            }),
-        )
-        .unwrap()
-        .0
-        .into_inner();
+        let values = audio_info(rate);
         let mut params = [Pod::from_bytes(&values).unwrap()];
+        let current_rate = Arc::new(AtomicU32::new(rate));
         let drain_flag = Arc::new(AtomicBool::new(false));
         let pw_audio_buffer = audio_buffer.clone();
         let pw_event_tx = ab_event_tx.clone();
+        let process_rate = current_rate.clone();
+        let negotiated_rate = current_rate.clone();
         let recv_stream = stream.clone();
         let recv_drain = drain_flag.clone();
+        let expected_rate = Rc::new(RefCell::new(Some(rate)));
+        let recv_expected_rate = expected_rate.clone();
         let _receiver = ab_effect_rx.attach(mainloop.loop_(), {
             move |e| match e {
                 AbEffect::ModifyVolume(mut volumes) => {
@@ -106,6 +95,15 @@ pub fn spawn(
                         recv_stream.flush(false).unwrap();
                     }
                 }
+                AbEffect::Reinit(rate) => {
+                    *recv_expected_rate.borrow_mut() = Some(rate);
+                    let values = audio_info(rate);
+                    let mut params = [Pod::from_bytes(&values).unwrap()];
+                    if let Err(e) = recv_stream.update_params(&mut params) {
+                        warn!("Failed to update audio stream: {e}");
+                        *recv_expected_rate.borrow_mut() = None;
+                    }
+                }
                 AbEffect::FlushConsumers => {
                     // SAFETY: This is called after AbEffect::Output(false) so
                     // it should be safe to clear the buffer.
@@ -115,7 +113,8 @@ pub fn spawn(
                         pw_audio_buffer.clear();
                     }
                     recv_stream.flush(false).unwrap();
-                    let _ = ab_event_tx.send(Internal(AudioBackendFlushed));
+                    recv_drain.store(false, Ordering::Relaxed);
+                    let _ = ab_event_tx.send(Internal(Flushed(Worker::AudioOutput)));
                 }
                 AbEffect::DrainOutput => {
                     recv_drain.store(true, Ordering::Relaxed);
@@ -133,10 +132,36 @@ pub fn spawn(
                     let mut volumes_guard = audio_volume.lock().unwrap();
                     volumes_guard.clear();
                     volumes_guard.extend(volumes.iter().map(|f| f.powf(1.0 / 3.0)));
-                    if let Some(cb) = &callback {
-                        cb(ExternalEvent::VolumesChanged(volumes_guard.clone()));
-                    }
+                    callback(ExternalEvent::VolumesChanged(volumes_guard.clone()));
                 }
+            })
+            .param_changed(move |_, (), id, pod| {
+                if id != libspa_sys::SPA_PARAM_Format {
+                    return;
+                }
+
+                let Some(pod) = pod else {
+                    return;
+                };
+
+                let mut audio_info = AudioInfoRaw::new();
+                if audio_info.parse(pod).is_err() {
+                    return;
+                }
+
+                let Some(expected) = *expected_rate.borrow() else {
+                    return;
+                };
+
+                if audio_info.format() != AudioFormat::F32LE
+                    || audio_info.channels() != 2
+                    || audio_info.rate() != expected
+                {
+                    return;
+                }
+
+                negotiated_rate.store(audio_info.rate(), Ordering::Relaxed);
+                *expected_rate.borrow_mut() = None;
             })
             .process(move |stream, ()| match stream.dequeue_buffer() {
                 None => warn!("Out of buffers"),
@@ -156,6 +181,7 @@ pub fn spawn(
                         return;
                     };
 
+                    let rate = process_rate.load(Ordering::Relaxed);
                     if let Some((filled, pts_ns)) = audio_buffer.fill(rate as usize, target_data) {
                         let rate = rate as i64;
                         let stride = audio_buffer.stride as i64;
@@ -174,7 +200,7 @@ pub fn spawn(
                         *chunk.size_mut() = (filled * audio_buffer.stride) as u32;
                     } else {
                         if drain_flag.load(Ordering::Relaxed) {
-                            let _ = pw_event_tx.send(Internal(SamplesDrained));
+                            let _ = pw_event_tx.send(Internal(Drained(Worker::AudioOutput)));
                             drain_flag.store(false, Ordering::Relaxed);
                         }
                         let chunk = data.chunk_mut();
@@ -195,4 +221,26 @@ pub fn spawn(
             .unwrap();
         mainloop.run();
     })
+}
+
+fn audio_info(rate: u32) -> Vec<u8> {
+    let mut audioinfo = AudioInfoRaw::new();
+    audioinfo.set_channels(2);
+    audioinfo.set_format(AudioFormat::F32LE);
+    audioinfo.set_rate(rate);
+    let mut position = [0; spa::param::audio::MAX_CHANNELS];
+    position[0] = libspa_sys::SPA_AUDIO_CHANNEL_FL;
+    position[1] = libspa_sys::SPA_AUDIO_CHANNEL_FR;
+    audioinfo.set_position(position);
+    PodSerializer::serialize(
+        Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(Object {
+            type_: libspa_sys::SPA_TYPE_OBJECT_Format,
+            id: libspa_sys::SPA_PARAM_EnumFormat,
+            properties: audioinfo.into(),
+        }),
+    )
+    .unwrap()
+    .0
+    .into_inner()
 }

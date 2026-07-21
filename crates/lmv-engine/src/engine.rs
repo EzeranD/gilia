@@ -1,24 +1,21 @@
 use std::{
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicI64, Ordering},
-    },
+    sync::{Arc, LazyLock, Mutex, atomic::AtomicI64},
     thread,
     time::Instant,
 };
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::Sender;
-use ffmpeg_next::{Packet, Stream, format::context::Input, media::Type};
 use tracing::error;
 
 use crate::{
+    TrackKind,
     session::{
-        AbEffect, DecoderEffect, DemuxerEffect, PlaybackMode, PlaybackPhase, PlayerEvent,
-        PlayerSession, PlayerSnapshot, VoEffect,
+        AbEffect, ActiveTracks, DecoderEffect, DemuxerEffect, PlaybackMode, PlaybackOperation,
+        PlaybackPhase, PlayerEvent, PlayerMeta, PlayerSession, PlayerSnapshot, TrackId, VoEffect,
     },
     subtitle::decoder::SubtitleFrame,
-    utils::{Clock, WakingSender},
+    utils::{Clock, TrackedPacket, WakingSender},
     video::frame::VideoFrame,
 };
 
@@ -30,7 +27,9 @@ pub fn get_engine_start() -> &'static Instant {
 
 #[derive(Debug, Clone)]
 pub enum ExternalEvent {
+    Opened(PlayerMeta),
     NewFrame,
+    TrackChanged(TrackKind, TrackId),
     VolumesChanged(Vec<f32>),
     Eof,
     Error(EngineError),
@@ -41,6 +40,7 @@ pub type ExternalCallback = Arc<dyn Fn(ExternalEvent) + Send + Sync>;
 pub struct PlayerEngine {
     pub config: Arc<EngineConfig>,
     pub state: Arc<ArcSwap<PlayerSnapshot>>,
+    pub clock: Arc<Clock>,
     external_callback: ExternalCallback,
     event_tx: Option<Sender<PlayerEvent>>,
     pub audio_info: AudioInfo,
@@ -61,7 +61,6 @@ pub enum EngineError {
 
 #[derive(Clone)]
 pub struct AudioInfo {
-    pub audio_clock: Arc<Clock>,
     pub volume: Arc<Mutex<Vec<f32>>>,
 }
 
@@ -80,6 +79,7 @@ pub struct SubOutput {
 #[derive(Clone)]
 pub struct SharedPlayerState {
     pub config: Arc<EngineConfig>,
+    pub clock: Arc<Clock>,
     pub audio_info: AudioInfo,
     pub video_output: VideoOutput,
     pub sub_output: SubOutput,
@@ -97,12 +97,18 @@ impl PlayerEngine {
             config: Arc::new(config),
             state: Arc::new(ArcSwap::from_pointee(PlayerSnapshot {
                 mode: PlaybackMode::Playing,
-                phase: PlaybackPhase::Normal,
+                operation: PlaybackOperation::None,
+                phase: PlaybackPhase::Active,
+                active_tracks: ActiveTracks {
+                    audio: None,
+                    video: None,
+                    subs: None,
+                },
             })),
+            clock: Arc::new(Clock::default()),
             external_callback,
             event_tx: None,
             audio_info: AudioInfo {
-                audio_clock: Arc::new(Clock::default()),
                 volume: Arc::new(Mutex::new(Vec::new())),
             },
             video_output: VideoOutput {
@@ -122,6 +128,7 @@ impl PlayerEngine {
 
         let shared = SharedPlayerState {
             config: self.config.clone(),
+            clock: self.clock.clone(),
             audio_info: self.audio_info.clone(),
             video_output: self.video_output.clone(),
             sub_output: self.sub_output.clone(),
@@ -134,6 +141,8 @@ impl PlayerEngine {
             .spawn(move || {
                 match PlayerSession::open(&path, shared, &external_callback, event_tx_clone) {
                     Ok(mut session) => {
+                        session_state.store(Arc::new(session.snapshot()));
+                        external_callback(ExternalEvent::Opened(session.meta.clone()));
                         while let Ok(event) = event_rx.recv() {
                             session.apply_event(event);
                             session_state.store(Arc::new(session.snapshot()));
@@ -157,8 +166,8 @@ impl PlayerEngine {
         }
     }
 
-    pub fn set_callback(&mut self, callback: ExternalCallback) {
-        self.external_callback = callback;
+    pub fn active_tracks(&self) -> ActiveTracks {
+        self.state.load().active_tracks
     }
 
     pub fn frame(&self) -> Option<VideoFrame> {
@@ -196,30 +205,21 @@ impl PlayerEngine {
         })
     }
 
-    pub fn position_ms(&self) -> Option<i64> {
-        if !self.audio_info.audio_clock.active.load(Ordering::Relaxed) {
-            return None;
-        }
-        Some(self.audio_info.audio_clock.get_ms())
+    pub fn position_ms(&self) -> i64 {
+        self.clock.get_ms()
     }
-}
-
-pub fn get_stream(ictx: &Input, stream_type: Type) -> Option<(Stream<'_>, usize)> {
-    let stream = ictx.streams().best(stream_type)?;
-    let stream_idx = stream.index();
-    Some((stream, stream_idx))
 }
 
 pub struct PlayerChannels {
     pub demuxer_tx: Option<Sender<DemuxerEffect>>,
     pub audio_tx: Option<WakingSender<DecoderEffect>>,
-    pub audio_packet_tx: Option<Sender<Packet>>,
+    pub audio_packet_tx: Option<Sender<TrackedPacket>>,
     pub pw_tx: Option<pipewire::channel::Sender<AbEffect>>,
     pub video_tx: Option<Sender<DecoderEffect>>,
-    pub video_packet_tx: Option<Sender<Packet>>,
+    pub video_packet_tx: Option<Sender<TrackedPacket>>,
     pub video_output_tx: Option<Sender<VoEffect>>,
     pub sub_tx: Option<Sender<DecoderEffect>>,
-    pub sub_packet_tx: Option<Sender<Packet>>,
+    pub sub_packet_tx: Option<Sender<TrackedPacket>>,
     pub external_callback: Option<ExternalCallback>,
     pub audio_clock: Option<Arc<Clock>>,
 }

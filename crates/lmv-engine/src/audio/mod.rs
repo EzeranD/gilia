@@ -4,14 +4,14 @@ use std::{
 };
 
 use crossbeam_channel::Sender;
-use ffmpeg_next::{Packet, Stream, codec::Context};
+use ffmpeg_next::{Stream, codec::Context};
 
 use crate::{
     PlayerEvent,
     audio::{self, decoder::AudioDecoder, queue::queue},
     engine::ExternalCallback,
     session::{AbEffect, DecoderEffect},
-    utils::{Clock, ThreadWaker, WakingSender, channel},
+    utils::{Clock, ThreadWaker, TrackedPacket, WakingSender, channel},
 };
 
 pub(crate) mod ab_pipewire;
@@ -19,7 +19,7 @@ pub(crate) mod decoder;
 pub(crate) mod queue;
 
 pub fn spawn_audio_stream(
-    audio_stream: &(Stream, usize),
+    audio_stream: &Stream,
     event_tx: &Sender<PlayerEvent>,
     external_callback: &ExternalCallback,
     volume: &Arc<Mutex<Vec<f32>>>,
@@ -30,15 +30,15 @@ pub fn spawn_audio_stream(
     JoinHandle<()>,
     WakingSender<DecoderEffect>,
     pipewire::channel::Sender<AbEffect>,
-    Sender<Packet>,
+    Sender<TrackedPacket>,
 ) {
-    let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::bounded(50);
+    let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::unbounded();
     let (pw_tx, pw_rx) = pipewire::channel::channel();
 
     audio_clock.active.store(true, Ordering::Relaxed);
 
-    let audio_context = Context::from_parameters(audio_stream.0.parameters()).unwrap();
-    let audio_time_base = audio_stream.0.time_base();
+    let audio_context = Context::from_parameters(audio_stream.parameters()).unwrap();
+    let audio_time_base = audio_stream.time_base();
     let decoder = audio_context.decoder().audio().unwrap();
     let audio_rate = decoder.rate();
     let waker = Arc::new(ThreadWaker::new());
@@ -46,6 +46,7 @@ pub fn spawn_audio_stream(
     let (audio_buffer_tx, audio_buffer_rx) = queue(128, waker.clone());
     let audio_event_tx = event_tx.clone();
     let decoder_waker = waker.clone();
+    let dec_audio_clock = audio_clock.clone();
     let dec_handle = std::thread::Builder::new()
         .name("audio-decoder".into())
         .spawn(move || {
@@ -57,6 +58,7 @@ pub fn spawn_audio_stream(
                 audio_time_base,
                 audio_rx,
                 audio_event_tx,
+                dec_audio_clock,
             );
             audio_decoder.process();
         })
@@ -69,7 +71,7 @@ pub fn spawn_audio_stream(
         audio_rate,
         audio_clock.clone(),
         volume.clone(),
-        Some(external_callback.clone()),
+        external_callback.clone(),
         path.to_string(),
     );
     (dec_handle, ab_handle, audio_tx, pw_tx, audio_packet_tx)

@@ -8,7 +8,8 @@ mod video;
 
 pub use engine::{EngineConfig, ExternalEvent, PlayerEngine, SharedPlayerState};
 pub use session::{
-    ActiveStreams, ControlEvent, PlaybackMode, PlaybackPhase, PlayerEvent, PlayerThreads,
+    ActiveTracks, ControlEvent, PlaybackMode, PlaybackOperation, PlaybackPhase, PlayerEvent,
+    PlayerMeta, PlayerThreads, TrackKind, TrackMeta,
 };
 pub use subtitle::decoder::SubtitleFrame;
 pub use video::frame::{Frame, GpuFrame, VideoFrame};

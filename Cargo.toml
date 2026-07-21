@@ -21,6 +21,7 @@ iced = { version = "0.15.0-dev", default-features = false, features = [
   "wayland",
   "advanced",
   "web-colors",
+  "fira-sans"
 ] }
 libass = { git = "https://github.com/EzeranD/libass-rs" }
 lmv-engine = { version = "0.1.0", path = "crates/lmv-engine" }

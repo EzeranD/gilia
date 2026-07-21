@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write,
     time::{Duration, Instant},
 };
 
@@ -20,7 +21,8 @@ use iced::{
 use lmv::{
     engine::{
         EngineConfig,
-        ExternalEvent::{self, VolumesChanged},
+        ExternalEvent::{self, Opened, TrackChanged, VolumesChanged},
+        PlayerMeta, TrackKind,
     },
     player::Player,
 };
@@ -84,6 +86,7 @@ enum WindowKind {
 struct App {
     windows: HashMap<window::Id, WindowKind>,
     player: Player,
+    metadata: Option<PlayerMeta>,
     video_hovered: bool,
     first_volume_change: bool,
     text_id: u32,
@@ -116,6 +119,7 @@ impl App {
             Self {
                 windows,
                 player,
+                metadata: None,
                 video_hovered: false,
                 first_volume_change: true,
                 text_id: 0,
@@ -165,25 +169,7 @@ impl App {
                 }
                 ScrollDelta::Pixels { x: _, y: _ } => Task::none(),
             },
-            Message::CallbackEvent(VolumesChanged(volumes)) => {
-                if self.first_volume_change {
-                    self.first_volume_change = false;
-                    return Task::none();
-                }
-                let channel1_vol = volumes.first().copied().unwrap_or(0.0);
-                let text = format!("Volume {}%", (channel1_vol * 100.0).round() as u32);
-                self.set_text(text, Duration::from_secs(2))
-            }
-            Message::CallbackEvent(ExternalEvent::Eof) => {
-                if self.eof_loop {
-                    self.player.seek_to(0);
-                    self.player.play();
-                }
-                Task::none()
-            }
-            Message::CallbackEvent(ExternalEvent::NewFrame | ExternalEvent::Error(_)) => {
-                Task::none()
-            }
+            Message::CallbackEvent(event) => self.callback_event(event),
             Message::ClearText(id) => {
                 if self.text_id == id {
                     self.text = None;
@@ -207,9 +193,62 @@ impl App {
         let text_id = self.text_id + 1;
         self.text_id = text_id;
         self.text = Some(text);
-        Task::perform(tokio::time::sleep(duration), move |_| {
+        Task::perform(tokio::time::sleep(duration), move |()| {
             Message::ClearText(text_id)
         })
+    }
+
+    fn callback_event(&mut self, event: ExternalEvent) -> Task<Message> {
+        match event {
+            Opened(meta) => {
+                self.metadata = Some(meta);
+                Task::none()
+            }
+            TrackChanged(kind, id) => {
+                let Some(meta) = self.metadata.as_ref() else {
+                    return Task::none();
+                };
+
+                let Some(track_meta) = meta.get_track(id) else {
+                    return Task::none();
+                };
+
+                let label = match kind {
+                    TrackKind::Audio => "Audio",
+                    TrackKind::Video => "Video",
+                    TrackKind::Subtitle => "Subtitles",
+                };
+
+                let mut text = format!("{label}: ({id})");
+
+                if let Some(title) = &track_meta.title {
+                    let _ = write!(text, "\"{title}\"");
+                }
+
+                if let Some(lang) = &track_meta.lang {
+                    let _ = write!(text, " ({lang})");
+                }
+
+                self.set_text(text, Duration::from_secs(2))
+            }
+            VolumesChanged(volumes) => {
+                if self.first_volume_change {
+                    self.first_volume_change = false;
+                    return Task::none();
+                }
+                let channel1_vol = volumes.first().copied().unwrap_or(0.0);
+                let text = format!("Volume {}%", (channel1_vol * 100.0).round() as u32);
+                self.set_text(text, Duration::from_secs(2))
+            }
+            ExternalEvent::Eof => {
+                if self.eof_loop {
+                    self.player.seek_to(0);
+                    self.player.play();
+                }
+                Task::none()
+            }
+            ExternalEvent::NewFrame | ExternalEvent::Error(_) => Task::none(),
+        }
     }
 
     fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
@@ -265,16 +304,45 @@ impl App {
                     }
                 }
                 Character("t") => {
-                    if let Some(ms) = self.player.position_ms() {
-                        let total_second = ms / 1000;
-                        let second = total_second % 60;
-                        let minute = (total_second / 60) % 60;
-                        let hour = total_second / 3600;
-                        let text = format!("{hour:02}:{minute:02}:{second:02}");
-                        self.set_text(text, Duration::from_secs(2))
-                    } else {
-                        Task::none()
+                    let total_second = self.player.position_ms() / 1000;
+                    let second = total_second % 60;
+                    let minute = (total_second / 60) % 60;
+                    let hour = total_second / 3600;
+                    let text = format!("{hour:02}:{minute:02}:{second:02}");
+                    self.set_text(text, Duration::from_secs(2))
+                }
+                Character("a") => {
+                    if let Some(meta) = &self.metadata {
+                        let active_tracks = self.player.active_tracks();
+                        if let Some(next_audio) =
+                            meta.next_track(TrackKind::Audio, active_tracks.audio)
+                        {
+                            self.player.select_track(TrackKind::Audio, next_audio.id);
+                        }
                     }
+                    Task::none()
+                }
+                Character("s") => {
+                    if let Some(meta) = &self.metadata {
+                        let active_tracks = self.player.active_tracks();
+                        if let Some(next_sub) =
+                            meta.next_track(TrackKind::Subtitle, active_tracks.subs)
+                        {
+                            self.player.select_track(TrackKind::Subtitle, next_sub.id);
+                        }
+                    }
+                    Task::none()
+                }
+                Character("v") => {
+                    if let Some(meta) = &self.metadata {
+                        let active_tracks = self.player.active_tracks();
+                        if let Some(next_video) =
+                            meta.next_track(TrackKind::Video, active_tracks.video)
+                        {
+                            self.player.select_track(TrackKind::Video, next_video.id);
+                        }
+                    }
+                    Task::none()
                 }
                 _ => Task::none(),
             }

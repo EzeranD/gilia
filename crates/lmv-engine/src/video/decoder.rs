@@ -7,7 +7,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased};
 use ffmpeg_next::{
     Packet, Rational, Rescale,
     codec::{Context, Parameters},
-    ffi as ffmsys,
+    ffi as ffmsys, frame,
 };
 use tracing::{debug, error};
 
@@ -17,50 +17,41 @@ use crate::{
     engine::EngineConfig,
     session::{
         DecoderEffect,
-        InternalEvent::{VideoDrained, VideoFlushed, VideoSynced},
-        PlayerEvent,
+        InternalEvent::{Drained, Flushed, Synced},
+        PlayerEvent, SyncMode, Worker,
     },
+    utils::{Clock, TrackedPacket},
     video::hw_ffmpeg::{HwOption, ManagedVideo, create_decoder, get_hw_options},
 };
 
 pub struct VideoDecoder {
     ctx: VideoContext,
-    state: VideoState,
+    state: DecoderState,
 }
 
 pub struct VideoContext {
     config: Arc<EngineConfig>,
+    clock: Arc<Clock>,
     decoder: Option<ManagedVideo>,
     mode: DecoderMode,
     parameters: Parameters,
-    stream: Receiver<Packet>,
+    packet_tx: Receiver<TrackedPacket>,
     frame_tx: Sender<VideoFrame>,
     effect_rx: Receiver<DecoderEffect>,
     event_tx: Sender<PlayerEvent>,
     time_base: Rational,
-    sync_target: Option<i64>,
     printed: bool,
 }
 
-pub enum VideoState {
-    Creating { packets: Vec<Packet> },
+pub enum DecoderState {
+    Creating {
+        packets: Vec<TrackedPacket>,
+        sync: Option<SyncMode>,
+    },
     Active,
+    Syncing(SyncMode),
     Draining,
     Idle,
-}
-
-impl std::fmt::Debug for VideoState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VideoState::Creating { packets } => f
-                .debug_struct("Creating")
-                .field("packets_count", &packets.len())
-                .finish(),
-            VideoState::Active => write!(f, "Active"),
-            VideoState::Draining => write!(f, "Draining"),
-            VideoState::Idle => write!(f, "Idle"),
-        }
-    }
 }
 
 impl VideoDecoder {
@@ -68,29 +59,31 @@ impl VideoDecoder {
     pub fn new(
         config: Arc<EngineConfig>,
         parameters: Parameters,
-        stream: Receiver<Packet>,
+        packet_tx: Receiver<TrackedPacket>,
         frame_tx: Sender<VideoFrame>,
         time_base: Rational,
         effect_rx: Receiver<DecoderEffect>,
         event_tx: Sender<PlayerEvent>,
+        clock: Arc<Clock>,
     ) -> Self {
         let ctx = VideoContext {
             config,
+            clock,
             decoder: None,
             mode: DecoderMode::Hw,
             parameters,
-            stream,
+            packet_tx,
             frame_tx,
             time_base,
             effect_rx,
             event_tx,
-            sync_target: None,
             printed: false,
         };
         Self {
             ctx,
-            state: VideoState::Creating {
+            state: DecoderState::Creating {
                 packets: Vec::new(),
+                sync: None,
             },
         }
     }
@@ -99,32 +92,51 @@ impl VideoDecoder {
         let VideoDecoder { ctx, state } = self;
         loop {
             match state {
-                VideoState::Creating { packets } => {
-                    ctx.init_decoder(packets);
-                    *state = VideoState::Active;
+                DecoderState::Creating { packets, sync } => {
+                    ctx.init_decoder(packets, *sync);
+                    *state = DecoderState::Active;
                     debug!("State changed: {:?}", state);
                 }
-                VideoState::Active => {
+                DecoderState::Active => {
                     select_biased! {
                         recv(ctx.effect_rx) -> effect => {
                             let effect = effect.unwrap();
                             ctx.effect_recv(effect, state);
                         }
-                        recv(ctx.stream) -> packet => ctx.decode(&packet.unwrap(), state)
+                        recv(ctx.packet_tx) -> packet => ctx.decode(state, &packet.unwrap())
                     }
                 }
-                VideoState::Draining => {
-                    match ctx.stream.try_recv() {
-                        Ok(packet) => ctx.decode(&packet, state),
+                DecoderState::Syncing(_) => {
+                    select_biased! {
+                        recv(ctx.effect_rx) -> effect => {
+                            let effect = effect.unwrap();
+                            ctx.effect_recv(effect, state);
+                        }
+                        recv(ctx.packet_tx) -> packet =>
+                            ctx.sync(state, &packet.unwrap())
+                    }
+                }
+                DecoderState::Draining => {
+                    match ctx.effect_rx.try_recv() {
+                        Ok(effect) => {
+                            ctx.effect_recv(effect, state);
+                            continue;
+                        }
+                        Err(TryRecvError::Disconnected) => return,
+                        Err(TryRecvError::Empty) => {}
+                    }
+
+                    match ctx.packet_tx.try_recv() {
+                        Ok(packet) => ctx.decode(state, &packet),
                         Err(TryRecvError::Empty) => {
-                            let _ = ctx.event_tx.send(Internal(VideoDrained));
-                            *state = VideoState::Idle;
+                            let _ = ctx.event_tx.send(Internal(Drained(Worker::VideoDecoder)));
+                            *state = DecoderState::Idle;
                             debug!("State changed: {:?}", state);
                         }
-                        Err(TryRecvError::Disconnected) => {} // TODO need to handle this better
+                        Err(TryRecvError::Disconnected) => return,
                     }
                 }
-                VideoState::Idle => {
+                DecoderState::Idle => {
                     let effect = ctx.effect_rx.recv().unwrap();
                     ctx.effect_recv(effect, state);
                 }
@@ -134,13 +146,13 @@ impl VideoDecoder {
 }
 
 impl VideoContext {
-    fn init_decoder(&mut self, packets: &mut Vec<Packet>) {
+    fn init_decoder(&mut self, packets: &mut Vec<TrackedPacket>, sync: Option<SyncMode>) {
         if self.config.hw_dec {
             let parameters = self.parameters.clone();
             let mut hw_options = get_hw_options(&parameters);
             for hw_option in &mut hw_options {
                 debug!("hw_cfg: {:?}", hw_option.hw_cfg);
-                if let Some(decoder) = self.init_hw(hw_option, packets) {
+                if let Some(decoder) = self.init_hw(hw_option, packets, sync) {
                     self.decoder = Some(decoder);
                     break;
                 }
@@ -157,30 +169,49 @@ impl VideoContext {
                     .unwrap(),
             );
             self.mode = DecoderMode::Sw;
+            let mut synced = false;
             for packet in packets {
                 if let Err(e) = decoder.send_packet(packet) {
                     error!("send_packet error: {e}");
                 }
-                loop {
-                    let mut src_frame = ffmpeg_next::frame::Video::empty();
-                    if decoder.receive_frame(&mut src_frame).is_err() {
-                        break;
+                while let Some(src_frame) = Self::receive_frame_from(&mut decoder) {
+                    let pts = src_frame
+                        .pts()
+                        .map(|ts| ts.rescale(self.time_base, (1, 1000)));
+
+                    if self.should_skip(pts, sync) {
+                        continue;
                     }
-                    self.process_frame(&mut decoder, src_frame);
+
+                    if sync.is_some() && !synced {
+                        let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                        synced = true;
+                    }
+
+                    let frame = wrap_frame(src_frame, pts, self.mode, &mut self.printed);
+                    let _ = self.frame_tx.send(frame);
                 }
             }
-
+            if sync.is_some() && !synced {
+                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+            }
             self.decoder = Some(decoder);
         }
     }
 
-    fn init_hw(&mut self, hw_option: &HwOption, packets: &mut Vec<Packet>) -> Option<ManagedVideo> {
+    fn init_hw(
+        &mut self,
+        hw_option: &HwOption,
+        packets: &mut Vec<TrackedPacket>,
+        sync: Option<SyncMode>,
+    ) -> Option<ManagedVideo> {
         let initialized = Arc::new(AtomicBool::new(false));
         let mut decoder = create_decoder(&self.parameters, initialized.clone(), hw_option);
         let mut i = 0;
+        let mut synced = false;
         while i <= packets.len() {
             if i == packets.len() {
-                let packet = self.stream.recv().unwrap();
+                let packet = self.packet_tx.recv().unwrap();
                 packets.push(packet);
             }
             if let Err(e) = decoder.send_packet(&packets[i]) {
@@ -199,19 +230,66 @@ impl VideoContext {
                 }
                 Ok(()) => {
                     if initialized.load(Ordering::Relaxed) {
-                        self.process_frame(&mut decoder, src_frame);
+                        let pts = src_frame
+                            .pts()
+                            .map(|ts| ts.rescale(self.time_base, (1, 1000)));
+
+                        let skip = self.should_skip(pts, sync);
+
+                        if !skip {
+                            if sync.is_some() && !synced {
+                                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                                synced = true;
+                            }
+                            let frame = wrap_frame(src_frame, pts, self.mode, &mut self.printed);
+                            let _ = self.frame_tx.send(frame);
+                        }
+
+                        while let Some(src_frame) = Self::receive_frame_from(&mut decoder) {
+                            let pts = src_frame
+                                .pts()
+                                .map(|ts| ts.rescale(self.time_base, (1, 1000)));
+
+                            if self.should_skip(pts, sync) {
+                                continue;
+                            }
+
+                            if sync.is_some() && !synced {
+                                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                                synced = true;
+                            }
+
+                            let frame = wrap_frame(src_frame, pts, self.mode, &mut self.printed);
+                            let _ = self.frame_tx.send(frame);
+                        }
 
                         for packet in &packets[i + 1..] {
                             if let Err(e) = decoder.send_packet(packet) {
                                 error!("send_packet error: {e}");
                             }
-                            loop {
-                                let mut src_frame = ffmpeg_next::frame::Video::empty();
-                                if decoder.receive_frame(&mut src_frame).is_err() {
-                                    break;
+                            while let Some(src_frame) = Self::receive_frame_from(&mut decoder) {
+                                let pts = src_frame
+                                    .pts()
+                                    .map(|ts| ts.rescale(self.time_base, (1, 1000)));
+
+                                if self.should_skip(pts, sync) {
+                                    continue;
                                 }
-                                self.process_frame(&mut decoder, src_frame);
+
+                                if sync.is_some() && !synced {
+                                    let _ =
+                                        self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                                    synced = true;
+                                }
+
+                                let frame =
+                                    wrap_frame(src_frame, pts, self.mode, &mut self.printed);
+                                let _ = self.frame_tx.send(frame);
                             }
+                        }
+
+                        if sync.is_some() && !synced {
+                            let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
                         }
 
                         return Some(decoder);
@@ -223,94 +301,146 @@ impl VideoContext {
         None
     }
 
-    fn decode(&mut self, packet: &Packet, state: &mut VideoState) {
+    fn decode(&mut self, state: &mut DecoderState, packet: &Packet) {
         if let Some(decoder) = &mut self.decoder
             && let Err(e) = decoder.send_packet(packet)
         {
             error!("send_packet error: {e}");
         }
 
-        loop {
-            let mut src_frame = ffmpeg_next::frame::Video::empty();
-            if let Some(decoder) = &mut self.decoder
-                && let Err(_) = decoder.receive_frame(&mut src_frame)
-            {
-                break;
-            }
-
-            let pts = src_frame
-                .pts()
-                .map(|ts| ts.rescale(self.time_base, (1, 1000)));
-
-            if let Some(sync_pts) = self.sync_target {
-                if pts.unwrap() >= sync_pts {
-                    crossbeam_channel::select_biased! {
-                        recv(self.effect_rx) -> effect => {
-                            let effect = effect.unwrap();
-                            self.effect_recv(effect, state);
-                            continue
-                        }
-                        send(self.frame_tx, wrap_frame(src_frame, pts, self.mode, &mut self.printed)) -> _res => {},
-                    }
-                    self.sync_target = None;
-                    if let Some(decoder) = &mut self.decoder {
-                        decoder.skip_frame(ffmpeg_next::Discard::Default);
-                    }
-                    let _ = self.event_tx.send(Internal(VideoSynced));
+        while let Some(frame) = self.receive_frame() {
+            let pts = frame.pts().map(|ts| ts.rescale(self.time_base, (1, 1000)));
+            crossbeam_channel::select_biased! {
+                recv(self.effect_rx) -> effect => {
+                    let effect = effect.unwrap();
+                    self.effect_recv(effect, state);
                 }
-            } else {
-                crossbeam_channel::select_biased! {
-                    recv(self.effect_rx) -> effect => {
-                        let effect = effect.unwrap();
-                        self.effect_recv(effect, state);
-                    }
-                    send(self.frame_tx, wrap_frame(src_frame, pts, self.mode, &mut self.printed)) -> _res => {},
-                }
+                send(self.frame_tx, wrap_frame(frame, pts, self.mode, &mut self.printed)) -> _res => {},
             }
         }
     }
 
-    fn process_frame(&mut self, decoder: &mut ManagedVideo, src_frame: ffmpeg_next::frame::Video) {
-        let pts = src_frame
-            .pts()
-            .map(|ts| ts.rescale(self.time_base, (1, 1000)));
+    fn sync(&mut self, state: &mut DecoderState, packet: &Packet) {
+        let mode = match state {
+            DecoderState::Syncing(mode) => *mode,
+            _ => return,
+        };
 
-        if let Some(sync_pts) = self.sync_target {
-            if pts.unwrap() >= sync_pts {
-                let frame = wrap_frame(src_frame, pts, self.mode, &mut self.printed);
-                let _ = self.frame_tx.send(frame);
+        if let Some(decoder) = &mut self.decoder
+            && let Err(e) = decoder.send_packet(packet)
+        {
+            error!("send_packet error: {e}");
+        }
 
-                self.sync_target = None;
-                decoder.skip_frame(ffmpeg_next::Discard::Default);
-                let _ = self.event_tx.send(Internal(VideoSynced));
+        let mut synced = false;
+        let mut interrupted = false;
+        while let Some(frame) = self.receive_frame() {
+            let pts = frame.pts().map(|ts| ts.rescale(self.time_base, (1, 1000)));
+
+            let target = match mode {
+                SyncMode::Target(target) => target,
+                SyncMode::FollowClock => self.clock.get_ms(),
+            };
+            if pts.is_some_and(|pts| pts < target) {
+                continue;
             }
-        } else {
-            let frame = wrap_frame(src_frame, pts, self.mode, &mut self.printed);
-            let _ = self.frame_tx.send(frame);
+
+            crossbeam_channel::select_biased! {
+                recv(self.effect_rx) -> effect => {
+                    let effect = effect.unwrap();
+                    self.effect_recv(effect, state);
+                    interrupted = true;
+                    break;
+                }
+                send(self.frame_tx, wrap_frame(frame, pts, self.mode, &mut self.printed)) -> _res => {},
+            }
+            if !synced {
+                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                if let Some(decoder) = &mut self.decoder {
+                    decoder.skip_frame(ffmpeg_next::Discard::Default);
+                }
+                synced = true;
+            }
+        }
+        if synced && !interrupted {
+            *state = DecoderState::Active;
         }
     }
 
-    fn effect_recv(&mut self, effect: DecoderEffect, state: &mut VideoState) {
+    fn receive_frame_from(decoder: &mut ManagedVideo) -> Option<frame::Video> {
+        let mut video_frame = frame::Video::empty();
+        decoder.receive_frame(&mut video_frame).ok()?;
+        Some(video_frame)
+    }
+
+    fn receive_frame(&mut self) -> Option<frame::Video> {
+        let Some(decoder) = &mut self.decoder else {
+            return None;
+        };
+        let mut audio = frame::Video::empty();
+        decoder.receive_frame(&mut audio).ok()?;
+        Some(audio)
+    }
+
+    fn should_skip(&self, pts: Option<i64>, sync: Option<SyncMode>) -> bool {
+        let Some(pts) = pts else {
+            return false;
+        };
+        match sync {
+            Some(SyncMode::Target(target)) => pts < target,
+            Some(SyncMode::FollowClock) => pts < self.clock.get_ms(),
+            None => false,
+        }
+    }
+
+    fn effect_recv(&mut self, effect: DecoderEffect, state: &mut DecoderState) {
         match effect {
             DecoderEffect::Flush => {
-                while self.stream.try_recv().is_ok() {}
+                while self.packet_tx.try_recv().is_ok() {}
                 if let Some(decoder) = &mut self.decoder {
                     decoder.flush();
                 }
-                *state = VideoState::Active;
-                let _ = self.event_tx.send(Internal(VideoFlushed));
+                *state = DecoderState::Idle;
+                let _ = self.event_tx.send(Internal(Flushed(Worker::VideoDecoder)));
             }
-            DecoderEffect::Sync(pts) => {
-                self.sync_target = Some(pts);
+            DecoderEffect::Sync(mode) => {
                 if let Some(decoder) = &mut self.decoder {
                     decoder.skip_frame(ffmpeg_next::Discard::NonReference);
+                    *state = DecoderState::Syncing(mode);
+                } else {
+                    *state = DecoderState::Creating {
+                        packets: Vec::new(),
+                        sync: Some(mode),
+                    };
                 }
-                *state = VideoState::Active;
             }
             DecoderEffect::Drain => {
-                *state = VideoState::Draining;
+                *state = DecoderState::Draining;
                 tracing::debug!("State changed: {:?}", state);
             }
+            DecoderEffect::Reinit(parameters, time_base) => {
+                self.parameters = parameters;
+                self.time_base = time_base;
+                self.printed = false;
+                self.decoder = None;
+                *state = DecoderState::Idle;
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DecoderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecoderState::Creating { packets, sync } => f
+                .debug_struct("Creating")
+                .field("packets_count", &packets.len())
+                .field("sync", sync)
+                .finish(),
+            DecoderState::Active => write!(f, "Active"),
+            DecoderState::Syncing(target) => write!(f, "Syncing({target:?})"),
+            DecoderState::Draining => write!(f, "Draining"),
+            DecoderState::Idle => write!(f, "Idle"),
         }
     }
 }

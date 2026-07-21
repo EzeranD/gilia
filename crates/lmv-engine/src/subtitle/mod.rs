@@ -7,12 +7,13 @@ use std::{
 };
 
 use crossbeam_channel::Sender;
-use ffmpeg_next::{Packet, Stream, codec::Context, format::context::Input, media::Type};
+use ffmpeg_next::{Stream, codec::Context, format::context::Input, media::Type};
 use libass::{OverrideBits, Renderer, Style, Track};
 
 use crate::{
     session::{DecoderEffect, PlayerEvent},
     subtitle::decoder::SubtitleDecoder,
+    utils::{Clock, TrackedPacket},
 };
 
 pub mod decoder;
@@ -20,11 +21,12 @@ pub mod decoder;
 pub fn spawn_sub_stream(
     ictx: &Input,
     event_tx: &Sender<PlayerEvent>,
-    sub_stream: (Stream, usize),
+    sub_stream: &Stream,
+    clock: Arc<Clock>,
     shared_track: Arc<Mutex<Option<Track>>>,
     shared_renderer: Arc<Mutex<Option<Renderer>>>,
-) -> (JoinHandle<()>, Sender<DecoderEffect>, Sender<Packet>) {
-    let sub_context = Context::from_parameters(sub_stream.0.parameters()).unwrap();
+) -> (JoinHandle<()>, Sender<DecoderEffect>, Sender<TrackedPacket>) {
+    let sub_context = Context::from_parameters(sub_stream.parameters()).unwrap();
     let mut lib = libass::Library::new().unwrap();
     for stream in ictx.streams() {
         if stream.parameters().medium() == Type::Attachment {
@@ -103,12 +105,12 @@ pub fn spawn_sub_stream(
             renderer.set_selective_style_override_enabled(OverrideBits::FULL_STYLE);
         }
     }
-    let sub_time_base = sub_stream.0.time_base();
+    let sub_time_base = sub_stream.time_base();
     let sub_track = shared_track.clone();
     *shared_renderer.lock().unwrap() = Some(renderer);
     *shared_track.lock().unwrap() = Some(track);
 
-    let (sub_packet_tx, sub_packet_rx) = crossbeam_channel::bounded(50);
+    let (sub_packet_tx, sub_packet_rx) = crossbeam_channel::unbounded();
     let (sub_tx, sub_rx) = crossbeam_channel::unbounded();
     let sub_event_tx = event_tx.clone();
     let dec_handle = std::thread::Builder::new()
@@ -118,9 +120,11 @@ pub fn spawn_sub_stream(
                 sub_context,
                 sub_packet_rx,
                 sub_track,
+                lib,
                 sub_time_base,
                 sub_rx,
                 sub_event_tx,
+                clock,
             );
             sub_decoder.process();
         })

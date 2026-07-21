@@ -15,8 +15,8 @@ use crate::{
     VideoFrame,
     engine::ExternalCallback,
     session::{
-        InternalEvent::{FramesDrained, VideoOutputFlushed},
-        VoEffect,
+        InternalEvent::{Drained, Flushed},
+        VoEffect, Worker,
     },
     utils::Clock,
 };
@@ -95,7 +95,7 @@ impl VideoOutput {
                             let audio_ms = self.audio_clock.get_ms();
                             let next_pts = frame.info.pts.unwrap();
                             let av_offset = next_pts - audio_ms;
-                            debug!("audio ms: {audio_ms}, av_offset: {av_offset}");
+                            debug!("current_ms: {audio_ms}, av_offset: {av_offset}");
                             self.present_frame(frame);
                         }
                     }
@@ -117,10 +117,6 @@ impl VideoOutput {
     }
 
     fn stage_next(&mut self) -> StageResult {
-        if !self.audio_clock.active.load(Ordering::Relaxed) {
-            return StageResult::Disconnected; // TODO later we wont rely on the audio for video only files
-        }
-
         let mut next_frame = {
             if let Some(f) = self.next_frame.take() {
                 f
@@ -129,7 +125,7 @@ impl VideoOutput {
                     Ok(f) => f,
                     Err(TryRecvError::Empty) => {
                         if self.drain {
-                            let _ = self.event_tx.send(Internal(FramesDrained));
+                            let _ = self.event_tx.send(Internal(Drained(Worker::VideoOutput)));
                             self.drain = false;
                             return StageResult::Drained;
                         }
@@ -158,7 +154,7 @@ impl VideoOutput {
                     }
                     Err(TryRecvError::Empty) => {
                         if self.drain {
-                            let _ = self.event_tx.send(Internal(FramesDrained));
+                            let _ = self.event_tx.send(Internal(Drained(Worker::VideoOutput)));
                             self.drain = false;
                             return StageResult::Drained;
                         }
@@ -182,6 +178,10 @@ impl VideoOutput {
     fn present_frame(&self, frame: VideoFrame) {
         let pts = frame.info.pts.unwrap_or(0);
         self.current_pts.store(pts, Ordering::Relaxed);
+        if !self.audio_clock.active.load(Ordering::Relaxed) {
+            let now = crate::engine::get_engine_start().elapsed().as_nanos() as i64;
+            self.audio_clock.update(pts * 1_000_000, now);
+        }
         *self.frame.lock().unwrap() = Some(frame);
         if let Some(cb) = &self.callback {
             cb(ExternalEvent::NewFrame);
@@ -207,7 +207,8 @@ impl VideoOutput {
                 while self.frame_rx.try_recv().is_ok() {}
                 self.next_frame = None;
                 self.last_pts = None;
-                let _ = self.event_tx.send(Internal(VideoOutputFlushed));
+                self.drain = false;
+                let _ = self.event_tx.send(Internal(Flushed(Worker::VideoOutput)));
             }
             VoEffect::DrainOutput => {
                 self.drain = true;

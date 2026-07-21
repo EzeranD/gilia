@@ -4,13 +4,13 @@ use std::{
 };
 
 use crossbeam_channel::Sender;
-use ffmpeg_next::{Packet, Stream};
+use ffmpeg_next::Stream;
 
 use crate::{
     EngineConfig, PlayerEvent, VideoFrame,
     engine::ExternalCallback,
     session::{DecoderEffect, VoEffect},
-    utils::Clock,
+    utils::{Clock, TrackedPacket},
     video::{decoder::VideoDecoder, output::VideoOutput},
 };
 
@@ -20,7 +20,7 @@ mod hw_ffmpeg;
 pub mod output;
 
 pub fn spawn_video_stream(
-    video_stream: &(Stream, usize),
+    video_stream: &Stream,
     event_tx: &Sender<PlayerEvent>,
     external_callback: Option<&ExternalCallback>,
     config: &Arc<EngineConfig>,
@@ -32,16 +32,17 @@ pub fn spawn_video_stream(
     JoinHandle<()>,
     Sender<DecoderEffect>,
     Sender<VoEffect>,
-    Sender<Packet>,
+    Sender<TrackedPacket>,
 ) {
     let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
     let (video_tx, video_rx) = crossbeam_channel::unbounded();
-    let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded(3);
+    let (video_packet_tx, video_packet_rx) = crossbeam_channel::unbounded();
 
-    let video_time_base = video_stream.0.time_base();
-    let parameters = video_stream.0.parameters();
+    let video_time_base = video_stream.time_base();
+    let parameters = video_stream.parameters();
     let video_event_tx = event_tx.clone();
     let config = config.clone();
+    let decoder_clock = audio_clock.clone();
     let dec_handle = std::thread::Builder::new()
         .name("video-decoder".into())
         .spawn(move || {
@@ -53,6 +54,7 @@ pub fn spawn_video_stream(
                 video_time_base,
                 video_rx,
                 video_event_tx,
+                decoder_clock,
             );
             decoder.process();
         })

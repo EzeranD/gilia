@@ -1,8 +1,9 @@
-
 use lmv_engine::{
-    ControlEvent::{ChangeVolumes, Pause, Play, Seek},
-    EngineConfig, ExternalEvent, PlaybackMode, PlaybackPhase, PlayerEngine,
+    ActiveTracks,
+    ControlEvent::{self, AudioMaster, ChangeVolumes, Pause, Play, Seek, SelectTrack},
+    EngineConfig, ExternalEvent, PlaybackMode, PlaybackOperation, PlaybackPhase, PlayerEngine,
     PlayerEvent::Control,
+    TrackKind,
 };
 use lmv_iced::widget::PlayerWidget;
 
@@ -25,12 +26,31 @@ impl Player {
         PlayerWidget::new(&self.engine)
     }
 
+    pub fn apply_event(&mut self, event: ControlEvent) {
+        self.engine.apply_event(Control(event));
+    }
+
+    pub fn active_tracks(&self) -> ActiveTracks {
+        self.engine.active_tracks()
+    }
+
     pub fn play(&mut self) {
         self.engine.apply_event(Control(Play));
     }
 
     pub fn pause(&mut self) {
         self.engine.apply_event(Control(Pause));
+    }
+
+    pub fn select_track(&mut self, kind: TrackKind, id: usize) {
+        let state = self.engine.state.load();
+        if !matches!(state.operation, PlaybackOperation::SwitchingTrack { .. }) {
+            self.engine.apply_event(Control(SelectTrack { kind, id }));
+        }
+    }
+
+    pub fn set_audio_master(&mut self, active: bool) {
+        self.engine.apply_event(Control(AudioMaster(active)));
     }
 
     pub fn toggle_playback(&mut self) {
@@ -42,22 +62,21 @@ impl Player {
             PlaybackMode::Paused => {
                 self.play();
             }
-            PlaybackMode::Stopped => {}
         }
     }
 
     pub fn seek_to(&mut self, pos_ms: i64) {
         let state = self.engine.state.load();
-        if !matches!(state.phase, PlaybackPhase::Seeking(_)) {
+        if !matches!(state.operation, PlaybackOperation::Seeking(_)) {
             self.engine.apply_event(Control(Seek(pos_ms)));
         }
     }
 
     pub fn seek_rel(&mut self, offset_ms: i64) {
         let state = self.engine.state.load();
-        if !matches!(state.phase, PlaybackPhase::Seeking(_)) {
+        if !matches!(state.operation, PlaybackOperation::Seeking(_)) {
             self.engine
-                .apply_event(Control(Seek(self.position_ms().unwrap_or(0) + offset_ms)));
+                .apply_event(Control(Seek(self.position_ms() + offset_ms)));
         }
     }
 
@@ -82,7 +101,7 @@ impl Player {
         volumes.first().copied().unwrap_or(0.0)
     }
 
-    pub fn position_ms(&self) -> Option<i64> {
+    pub fn position_ms(&self) -> i64 {
         self.engine.position_ms()
     }
 }
