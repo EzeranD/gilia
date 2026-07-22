@@ -3,10 +3,10 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicI64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use tracing::debug;
 
 use crate::{
@@ -21,19 +21,18 @@ use crate::{
     utils::Clock,
 };
 
-const THRESHOLD: i64 = 20;
-
 pub struct VideoOutput {
     audio_clock: Arc<Clock>,
     frame_rx: Receiver<VideoFrame>,
     frame: Arc<Mutex<Option<VideoFrame>>>,
     current_pts: Arc<AtomicI64>,
     next_frame: Option<VideoFrame>,
-    drain: bool,
-    state: OutputState,
     effect_rx: Receiver<VoEffect>,
     event_tx: Sender<PlayerEvent>,
     callback: Option<ExternalCallback>,
+    state: OutputState,
+    last_pts: Option<i64>,
+    drain: bool,
 }
 
 enum OutputState {
@@ -41,8 +40,8 @@ enum OutputState {
     Idle,
 }
 
-enum PresentResult {
-    Delay(Duration),
+enum StageResult {
+    Deadline(Instant),
     Empty,
     Drained,
     Disconnected,
@@ -64,29 +63,48 @@ impl VideoOutput {
             frame,
             current_pts,
             next_frame: None,
-            drain: false,
-            state: OutputState::Active,
             effect_rx,
             event_tx,
             callback,
+            state: OutputState::Active,
+            last_pts: None,
+            drain: false,
         }
     }
 
     pub fn process(&mut self) {
         loop {
-            while let Ok(effect) = self.effect_rx.try_recv() {
-                self.effect_recv(effect);
-            }
-
             match &mut self.state {
-                OutputState::Active => match self.present_next() {
-                    PresentResult::Delay(duration) => {
-                        std::thread::park_timeout(duration);
+                OutputState::Active => match self.stage_next() {
+                    StageResult::Deadline(deadline) => {
+                        // TODO render subs here instead of in the widget i'm waiting till we have track switching for this
+                        if deadline > Instant::now() {
+                            match self.effect_rx.recv_deadline(deadline) {
+                                Ok(effect) => {
+                                    self.effect_recv(effect);
+                                    continue;
+                                }
+                                Err(RecvTimeoutError::Timeout) => {}
+                                Err(RecvTimeoutError::Disconnected) => {
+                                    self.state = OutputState::Idle;
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(frame) = self.next_frame.take() {
+                            let audio_ms = self.audio_clock.get_ms();
+                            let next_pts = frame.info.pts.unwrap();
+                            let av_offset = next_pts - audio_ms;
+                            debug!("audio ms: {audio_ms}, av_offset: {av_offset}");
+                            self.present_frame(frame);
+                        }
                     }
-                    PresentResult::Empty => {
-                        std::thread::park_timeout(Duration::from_millis(1));
+                    StageResult::Empty => {
+                        if let Ok(effect) = self.effect_rx.recv_timeout(Duration::from_millis(1)) {
+                            self.effect_recv(effect);
+                        }
                     }
-                    PresentResult::Drained | PresentResult::Disconnected => {
+                    StageResult::Drained | StageResult::Disconnected => {
                         self.state = OutputState::Idle;
                     }
                 },
@@ -98,13 +116,12 @@ impl VideoOutput {
         }
     }
 
-    fn present_next(&mut self) -> PresentResult {
+    fn stage_next(&mut self) -> StageResult {
         if !self.audio_clock.active.load(Ordering::Relaxed) {
-            return PresentResult::Disconnected; // TODO later we wont rely on the audio for video only files
+            return StageResult::Disconnected; // TODO later we wont rely on the audio for video only files
         }
 
-        let audio_ms = self.audio_clock.get_ms();
-        let mut current_frame = {
+        let mut next_frame = {
             if let Some(f) = self.next_frame.take() {
                 f
             } else {
@@ -114,71 +131,51 @@ impl VideoOutput {
                         if self.drain {
                             let _ = self.event_tx.send(Internal(FramesDrained));
                             self.drain = false;
-                            return PresentResult::Drained;
+                            return StageResult::Drained;
                         }
-                        return PresentResult::Empty;
+                        return StageResult::Empty;
                     }
-                    Err(TryRecvError::Disconnected) => return PresentResult::Disconnected,
+                    Err(TryRecvError::Disconnected) => return StageResult::Disconnected,
                 }
             }
         };
 
         loop {
-            let current_pts = current_frame.info.pts.unwrap();
-            let av_offset = current_pts - audio_ms;
-            debug!("audio ms: {audio_ms}, av_offset: {av_offset}");
+            let audio_ms = self.audio_clock.get_ms();
+            let next_pts = next_frame.info.pts.unwrap();
+            let av_offset = next_pts - audio_ms;
 
-            if av_offset > THRESHOLD {
-                self.next_frame = Some(current_frame);
-                return PresentResult::Delay(Duration::from_millis((av_offset - THRESHOLD) as u64));
-            }
+            let frame_duration = self
+                .last_pts
+                .map_or(41, |prev| (next_pts - prev).abs().max(1));
+            self.last_pts = Some(next_pts);
 
-            if av_offset < -THRESHOLD {
+            if av_offset < -frame_duration {
                 match self.frame_rx.try_recv() {
                     Ok(f) => {
-                        current_frame = f;
+                        next_frame = f;
                         continue;
                     }
                     Err(TryRecvError::Empty) => {
                         if self.drain {
                             let _ = self.event_tx.send(Internal(FramesDrained));
                             self.drain = false;
-                            return PresentResult::Drained;
+                            return StageResult::Drained;
                         }
-                        return PresentResult::Empty;
+                        return StageResult::Empty;
                     }
                     Err(_) => {
-                        self.present_frame(current_frame);
-                        return PresentResult::Disconnected;
+                        return StageResult::Disconnected;
                     }
                 }
             }
 
-            let next_frame = {
-                match self.frame_rx.try_recv() {
-                    Ok(f) => f,
-                    Err(TryRecvError::Empty) => {
-                        if self.drain {
-                            let _ = self.event_tx.send(Internal(FramesDrained));
-                            self.drain = false;
-                            return PresentResult::Drained;
-                        }
-                        return PresentResult::Empty;
-                    }
-                    Err(_) => {
-                        self.present_frame(current_frame);
-                        return PresentResult::Disconnected;
-                    }
-                }
-            };
-            let next_error = next_frame.info.pts.unwrap() - audio_ms;
-            if next_error <= THRESHOLD {
-                current_frame = next_frame;
-            } else {
-                self.next_frame = Some(next_frame);
-                self.present_frame(current_frame);
-                return PresentResult::Delay(Duration::from_millis(next_error as u64));
-            }
+            let max_offset = (frame_duration + frame_duration / 2) as u64;
+            let delay_ms = av_offset.max(0) as u64;
+            let deadline = Instant::now() + Duration::from_millis(delay_ms.min(max_offset));
+
+            self.next_frame = Some(next_frame);
+            return StageResult::Deadline(deadline);
         }
     }
 
@@ -201,6 +198,7 @@ impl VideoOutput {
                 }
             }
             VoEffect::Present => {
+                self.next_frame = None;
                 if let Ok(current_frame) = self.frame_rx.recv() {
                     self.present_frame(current_frame);
                 }
@@ -208,6 +206,7 @@ impl VideoOutput {
             VoEffect::FlushConsumers => {
                 while self.frame_rx.try_recv().is_ok() {}
                 self.next_frame = None;
+                self.last_pts = None;
                 let _ = self.event_tx.send(Internal(VideoOutputFlushed));
             }
             VoEffect::DrainOutput => {

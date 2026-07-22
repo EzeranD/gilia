@@ -217,7 +217,7 @@ pub struct PlayerChannels {
     pub pw_tx: Option<pipewire::channel::Sender<AbEffect>>,
     pub video_tx: Option<Sender<DecoderEffect>>,
     pub video_packet_tx: Option<Sender<Packet>>,
-    pub video_output_tx: Option<WakingSender<VoEffect>>,
+    pub video_output_tx: Option<Sender<VoEffect>>,
     pub sub_tx: Option<Sender<DecoderEffect>>,
     pub sub_packet_tx: Option<Sender<Packet>>,
     pub external_callback: Option<ExternalCallback>,
@@ -266,7 +266,7 @@ impl PlayerChannels {
             let _ = tx.send(effect);
         }
     }
-    pub fn vp(&self, effect: VoEffect) {
+    pub fn vo(&self, effect: VoEffect) {
         if let Some(tx) = &self.video_output_tx {
             let _ = tx.send(effect);
         }

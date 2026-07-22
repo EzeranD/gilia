@@ -249,18 +249,18 @@ impl PlayerSession {
             ControlEvent::Play => {
                 self.mode = PlaybackMode::Playing;
                 self.channels.ab(AbEffect::Output(true));
-                self.channels.vp(VoEffect::Output(true));
+                self.channels.vo(VoEffect::Output(true));
             }
             ControlEvent::Pause => {
                 self.mode = PlaybackMode::Paused;
                 self.channels.ab(AbEffect::Output(false));
-                self.channels.vp(VoEffect::Output(false));
+                self.channels.vo(VoEffect::Output(false));
             }
             ControlEvent::Seek(pts) => {
                 self.phase = PlaybackPhase::Seeking(SeekingState::new(pts));
                 self.channels.demuxer(DemuxerEffect::SeekDemuxer(pts));
                 self.channels.ab(AbEffect::Output(false));
-                self.channels.vp(VoEffect::Output(false));
+                self.channels.vo(VoEffect::Output(false));
                 if let Some(clock) = &self.channels.audio_clock {
                     let now = get_engine_start().elapsed().as_nanos() as i64;
                     clock.update(pts * 1_000_000, now);
@@ -285,7 +285,7 @@ impl PlayerSession {
                     if seeking.is_flushed(&self.streams) {
                         seeking.audio = TrackSeekState::NeedsFlush;
                         seeking.video = TrackSeekState::NeedsFlush;
-                        self.channels.vp(VoEffect::FlushConsumers);
+                        self.channels.vo(VoEffect::FlushConsumers);
                         self.channels.ab(AbEffect::FlushConsumers);
                     }
                 }
@@ -296,7 +296,7 @@ impl PlayerSession {
                     if seeking.is_flushed(&self.streams) {
                         seeking.audio = TrackSeekState::NeedsFlush;
                         seeking.video = TrackSeekState::NeedsFlush;
-                        self.channels.vp(VoEffect::FlushConsumers);
+                        self.channels.vo(VoEffect::FlushConsumers);
                         self.channels.ab(AbEffect::FlushConsumers);
                     }
                 }
@@ -331,10 +331,10 @@ impl PlayerSession {
                         match self.mode {
                             PlaybackMode::Playing => {
                                 self.channels.ab(AbEffect::Output(true));
-                                self.channels.vp(VoEffect::Present);
-                                self.channels.vp(VoEffect::Output(true));
+                                self.channels.vo(VoEffect::Present);
+                                self.channels.vo(VoEffect::Output(true));
                             }
-                            PlaybackMode::Paused => self.channels.vp(VoEffect::Present),
+                            PlaybackMode::Paused => self.channels.vo(VoEffect::Present),
                             PlaybackMode::Stopped => {}
                         }
                     }
@@ -348,10 +348,10 @@ impl PlayerSession {
                         match self.mode {
                             PlaybackMode::Playing => {
                                 self.channels.ab(AbEffect::Output(true));
-                                self.channels.vp(VoEffect::Present);
-                                self.channels.vp(VoEffect::Output(true));
+                                self.channels.vo(VoEffect::Present);
+                                self.channels.vo(VoEffect::Output(true));
                             }
-                            PlaybackMode::Paused => self.channels.vp(VoEffect::Present),
+                            PlaybackMode::Paused => self.channels.vo(VoEffect::Present),
                             PlaybackMode::Stopped => {}
                         }
                     }
@@ -367,14 +367,14 @@ impl PlayerSession {
                     draining.audio = TrackDrainState::DecoderDrained;
                 }
                 self.channels.ab(AbEffect::DrainOutput);
-                self.channels.vp(VoEffect::DrainOutput);
+                self.channels.vo(VoEffect::DrainOutput);
             }
             InternalEvent::VideoDrained => {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {
                     draining.video = TrackDrainState::DecoderDrained;
                 }
                 self.channels.ab(AbEffect::DrainOutput);
-                self.channels.vp(VoEffect::DrainOutput);
+                self.channels.vo(VoEffect::DrainOutput);
             }
             InternalEvent::FramesDrained => {
                 if let PlaybackPhase::Draining(draining) = &mut self.phase {

@@ -10,7 +10,7 @@ use crate::{
     EngineConfig, PlayerEvent, VideoFrame,
     engine::ExternalCallback,
     session::{DecoderEffect, VoEffect},
-    utils::{Clock, ThreadWaker, WakingSender},
+    utils::Clock,
     video::{decoder::VideoDecoder, output::VideoOutput},
 };
 
@@ -31,7 +31,7 @@ pub fn spawn_video_stream(
     JoinHandle<()>,
     JoinHandle<()>,
     Sender<DecoderEffect>,
-    WakingSender<VoEffect>,
+    Sender<VoEffect>,
     Sender<Packet>,
 ) {
     let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
@@ -58,11 +58,9 @@ pub fn spawn_video_stream(
         })
         .unwrap();
 
-    let waker = Arc::new(ThreadWaker::new());
     let (vo_tx, vp_rx) = crossbeam_channel::unbounded();
-    let vo_tx = WakingSender::new(vo_tx, waker.clone());
 
-    let mut tick_scheduler = VideoOutput::new(
+    let mut video_output = VideoOutput::new(
         audio_clock.clone(),
         frame_rx.clone(),
         frame.clone(),
@@ -72,8 +70,7 @@ pub fn spawn_video_stream(
         external_callback.cloned(),
     );
     let output_handle = std::thread::spawn(move || {
-        waker.set();
-        tick_scheduler.process();
+        video_output.process();
     });
     (dec_handle, output_handle, video_tx, vo_tx, video_packet_tx)
 }
