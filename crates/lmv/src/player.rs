@@ -1,7 +1,7 @@
 use lmv_engine::{
     ActiveTracks,
     ControlEvent::{self, AudioMaster, ChangeVolumes, Pause, Play, Seek, SelectTrack},
-    EngineConfig, ExternalEvent, PlaybackMode, PlaybackOperation, PlaybackPhase, PlayerEngine,
+    EngineConfig, ExternalEvent, PlaybackMode, PlaybackOperation, PlayerEngine,
     PlayerEvent::Control,
     TrackKind,
 };

@@ -14,10 +14,7 @@ use crate::{
     PlayerEvent::{self, Internal},
     VideoFrame,
     engine::ExternalCallback,
-    session::{
-        InternalEvent::{Drained, Flushed},
-        VoEffect, Worker,
-    },
+    session::{InternalEvent::Drained, VoEffect, Worker},
     utils::Clock,
 };
 
@@ -203,12 +200,12 @@ impl VideoOutput {
                     self.present_frame(current_frame);
                 }
             }
-            VoEffect::FlushConsumers => {
+            VoEffect::FlushConsumers(flush_tx) => {
                 while self.frame_rx.try_recv().is_ok() {}
                 self.next_frame = None;
                 self.last_pts = None;
                 self.drain = false;
-                let _ = self.event_tx.send(Internal(Flushed(Worker::VideoOutput)));
+                let _ = flush_tx.send(Worker::VideoOutput);
             }
             VoEffect::DrainOutput => {
                 self.drain = true;

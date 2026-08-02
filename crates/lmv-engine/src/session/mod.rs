@@ -1,119 +1,51 @@
 use std::{
-    sync::{Arc, atomic::Ordering},
+    collections::VecDeque,
+    sync::{Arc, atomic::Ordering::Relaxed},
     thread::JoinHandle,
 };
 
-use crossbeam_channel::Sender;
-use ffmpeg_next::{Rational, codec::Parameters, format::input, media::Type};
+use arc_swap::ArcSwap;
+use crossbeam_channel::{Receiver, Sender, bounded};
+use ffmpeg_next::{Rational, codec::Parameters};
 use tracing::debug;
 
+mod messages;
 mod metadata;
+mod open;
 mod state;
 
+pub(crate) use messages::SessionChannels;
+pub use messages::{
+    AbEffect, ControlEvent, DecoderEffect, DemuxerEffect, InternalEvent, PlayerEvent,
+    ReinitDetails, SyncMode, VoEffect,
+};
 pub use metadata::{PlayerMeta, TrackId, TrackKind, TrackMeta};
 pub use state::{
-    ActiveTracks, DrainingState, PlaybackMode, PlaybackOperation, PlaybackPhase, PlayerSnapshot,
-    SeekingState, TrackDrainState, TrackSeekState, Worker,
+    ActiveTracks, DrainingState, PlaybackMode, PlaybackOperation, PlaybackPhase, SeekingState,
+    SessionState, TrackDrainState, TrackSeekState, Worker,
 };
 
 use crate::{
     ExternalEvent, SharedPlayerState,
-    audio::spawn_audio_stream,
-    demuxer::Demuxer,
-    engine::{EngineError, ExternalCallback, PlayerChannels, get_engine_start},
-    subtitle::spawn_sub_stream,
-    utils::{MemoryBudget, ThreadWaker},
-    video::spawn_video_stream,
+    engine::{EngineError, ExternalCallback, get_engine_start},
+    session::{
+        TrackSeekState::{Flushed, Synced},
+        open::open,
+    },
 };
-
 pub type Pts = state::Pts;
 
 pub struct PlayerSession {
-    pub mode: PlaybackMode,
-    pub operation: PlaybackOperation,
-    pub phase: PlaybackPhase,
+    pub state: SessionState,
     pub shared: SharedPlayerState,
-    pub external_callback: ExternalCallback,
-    pub event_tx: Sender<PlayerEvent>,
-    pub streams: ActiveTracks,
-    pub channels: PlayerChannels,
+    pub channels: SessionChannels,
+    op_queue: VecDeque<PlayerEvent>,
     pub threads: PlayerThreads,
     pub meta: PlayerMeta,
+    snapshot_state: Arc<ArcSwap<SessionState>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum PlayerEvent {
-    Control(ControlEvent),
-    Internal(InternalEvent),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ControlEvent {
-    Play,
-    Pause,
-    Seek(Pts),
-    AudioMaster(bool),
-    SelectTrack { kind: TrackKind, id: TrackId },
-    ChangeVolumes(Vec<f32>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum InternalEvent {
-    DemuxerSeeked,
-    Flushed(Worker),
-    Synced(Worker),
-    Reinitialized {
-        worker: Worker,
-        details: ReinitDetails,
-    },
-    DemuxerEof,
-    Drained(Worker),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ReinitDetails {
-    None,
-    Audio { rate: u32 },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum DemuxerEffect {
-    SeekDemuxer(Pts),
-    ResumeDemuxer,
-    SwitchStream { kind: TrackKind, id: TrackId },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncMode {
-    Target(Pts),
-    FollowClock,
-}
-
-#[derive(Clone)]
-pub enum DecoderEffect {
-    Flush,
-    Sync(SyncMode),
-    Drain,
-    Reinit(Parameters, Rational),
-}
-
-#[derive(Debug)]
-pub enum AbEffect {
-    Output(bool),
-    FlushConsumers,
-    Reinit(u32),
-    ModifyVolume(Vec<f32>),
-    DrainOutput,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum VoEffect {
-    Output(bool),
-    Present,
-    FlushConsumers,
-    DrainOutput,
-}
-
+#[derive(Default)]
 pub struct PlayerThreads {
     pub demuxer: Option<JoinHandle<()>>,
     pub audio_decoder: Option<JoinHandle<()>>,
@@ -129,61 +61,50 @@ impl PlayerSession {
         shared: SharedPlayerState,
         external_callback: &ExternalCallback,
         event_tx: Sender<PlayerEvent>,
+        snapshot_state: Arc<ArcSwap<SessionState>>,
     ) -> Result<Self, EngineError> {
         let (streams, channels, threads, meta) = open(path, &shared, external_callback, &event_tx)?;
-        Ok(Self {
-            mode: PlaybackMode::Playing,
-            operation: PlaybackOperation::None,
-            phase: PlaybackPhase::Active,
-
+        let session = Self {
+            state: SessionState::new(streams),
             shared,
-            external_callback: external_callback.clone(),
-            event_tx,
-            streams,
             channels,
+            op_queue: VecDeque::new(),
             threads,
             meta,
-        })
-    }
-    pub fn snapshot(&self) -> PlayerSnapshot {
-        PlayerSnapshot {
-            mode: self.mode,
-            operation: self.operation,
-            phase: self.phase,
-            active_tracks: self.streams,
-        }
+            snapshot_state,
+        };
+        session.snapshot();
+        Ok(session)
     }
 
-    pub fn apply_event(&mut self, event: PlayerEvent) {
+    pub fn snapshot(&self) {
+        self.snapshot_state.store(Arc::new(self.state));
+    }
+
+    pub fn apply_event(&mut self, event: PlayerEvent, event_rx: &Receiver<PlayerEvent>) {
         debug!("Event received: {event:?}");
         match event {
-            PlayerEvent::Control(event) => self.apply_control(event),
+            PlayerEvent::Control(event) => self.apply_control(event, event_rx),
             PlayerEvent::Internal(event) => self.apply_internal(event),
         }
     }
 
-    fn apply_control(&mut self, event: ControlEvent) {
+    fn apply_control(&mut self, event: ControlEvent, event_rx: &Receiver<PlayerEvent>) {
         match event {
             ControlEvent::Play => {
-                self.mode = PlaybackMode::Playing;
+                self.state.mode = PlaybackMode::Playing;
+                self.snapshot();
                 self.channels.ab(AbEffect::Output(true));
                 self.channels.vo(VoEffect::Output(true));
             }
             ControlEvent::Pause => {
-                self.mode = PlaybackMode::Paused;
+                self.state.mode = PlaybackMode::Paused;
+                self.snapshot();
                 self.channels.ab(AbEffect::Output(false));
                 self.channels.vo(VoEffect::Output(false));
             }
-            ControlEvent::Seek(pts) => {
-                self.operation = PlaybackOperation::Seeking(SeekingState::new(pts));
-                self.phase = PlaybackPhase::Active;
-                self.channels.demuxer(DemuxerEffect::SeekDemuxer(pts));
-                self.channels.ab(AbEffect::Output(false));
-                self.channels.vo(VoEffect::Output(false));
-                if let Some(clock) = &self.channels.audio_clock {
-                    let now = get_engine_start().elapsed().as_nanos() as i64;
-                    clock.update(pts * 1_000_000, now);
-                }
+            ControlEvent::ChangeVolumes(vol) => {
+                self.channels.ab(AbEffect::ModifyVolume(vol));
             }
             ControlEvent::AudioMaster(active) => {
                 self.shared
@@ -191,268 +112,340 @@ impl PlayerSession {
                     .active
                     .store(active, std::sync::atomic::Ordering::Relaxed);
             }
-            ControlEvent::SelectTrack { kind, id } => {
-                if self
-                    .meta
-                    .get_track(id)
-                    .is_none_or(|track| track.kind != kind)
-                {
+            ControlEvent::Seek(pts) => {
+                if self.state.is_busy() {
+                    debug!("Adding {event:?} to the queue");
+                    self.op_queue.push_back(PlayerEvent::Control(event));
                     return;
                 }
-
-                self.operation = PlaybackOperation::SwitchingTrack { kind, id };
-                self.phase = PlaybackPhase::Active;
-                match kind {
-                    TrackKind::Audio => {
-                        self.channels.ab(AbEffect::Output(false));
-                        self.shared
-                            .clock
-                            .active
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                        self.channels
-                            .demuxer(DemuxerEffect::SwitchStream { kind, id });
-                    }
-                    TrackKind::Video | TrackKind::Subtitle => {
-                        self.channels
-                            .demuxer(DemuxerEffect::SwitchStream { kind, id });
-                    }
+                self.seek(event_rx, pts);
+            }
+            ControlEvent::SelectTrack { id, kind } => {
+                if self.state.is_busy() {
+                    self.op_queue.push_back(PlayerEvent::Control(event));
+                    return;
                 }
+                let Some(track) = self.meta.get_track(id) else {
+                    return;
+                };
+                if track.kind != kind {
+                    return;
+                }
+                let params = track.params.clone();
+                let time_base = track.time_base;
+                self.switch_track(event_rx, id, kind, params, time_base);
             }
-            ControlEvent::ChangeVolumes(vol) => {
-                self.channels.ab(AbEffect::ModifyVolume(vol));
+        }
+        if !self.state.is_busy()
+            && let Some(event) = self.op_queue.pop_front()
+        {
+            self.apply_event(event, event_rx);
+        }
+    }
+
+    fn seek(&mut self, event_rx: &Receiver<PlayerEvent>, pts: i64) {
+        let mut state = SeekingState::new(pts);
+        self.state.operation = PlaybackOperation::Seeking(state);
+        self.snapshot();
+        self.channels.ab(AbEffect::Output(false));
+        self.channels.vo(VoEffect::Output(false));
+        let now = get_engine_start().elapsed().as_nanos() as i64;
+        self.shared.clock.update(pts * 1_000_000, now);
+
+        let (seek_tx, seek_rx) = bounded(1);
+        self.channels
+            .demuxer(DemuxerEffect::SeekDemuxer(seek_tx, pts));
+        self.wait_for(event_rx, &seek_rx);
+        self.state.phase = PlaybackPhase::Active;
+        self.snapshot();
+
+        let (dec_flush_tx, dec_flush_rx) = bounded(1);
+        self.channels
+            .audio(DecoderEffect::Flush(dec_flush_tx.clone()));
+        self.channels
+            .video(DecoderEffect::Flush(dec_flush_tx.clone()));
+        self.channels
+            .sub(DecoderEffect::Flush(dec_flush_tx.clone()));
+
+        while !state.dec_flushed(&self.state.tracks) {
+            let resp = self.wait_for(event_rx, &dec_flush_rx);
+            debug!(?resp);
+            state.set_state(resp, Flushed);
+            self.state.operation = PlaybackOperation::Seeking(state);
+            self.snapshot();
+        }
+
+        let (con_flush_tx, con_flush_rx) = bounded(1);
+        self.channels
+            .ab(AbEffect::FlushConsumers(con_flush_tx.clone()));
+        self.channels
+            .vo(VoEffect::FlushConsumers(con_flush_tx.clone()));
+
+        while !state.out_flushed(&self.state.tracks) {
+            let resp = self.wait_for(event_rx, &con_flush_rx);
+            debug!(?resp);
+            state.set_state(resp, Flushed);
+            self.state.operation = PlaybackOperation::Seeking(state);
+            self.snapshot();
+        }
+
+        let (sync_tx, sync_rx) = bounded(3);
+
+        let sync = SyncMode::Target(pts);
+        self.channels
+            .audio(DecoderEffect::Sync(sync_tx.clone(), sync));
+        self.channels
+            .video(DecoderEffect::Sync(sync_tx.clone(), sync));
+        self.channels.sub(DecoderEffect::Sync(sync_tx, sync));
+        self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
+
+        while !state.dec_synced(&self.state.tracks) {
+            let resp = self.wait_for(event_rx, &sync_rx);
+            debug!(?resp);
+            state.set_state(resp, Synced);
+            self.state.operation = PlaybackOperation::Seeking(state);
+            self.snapshot();
+        }
+
+        self.state.operation = PlaybackOperation::None;
+        if self.state.phase == PlaybackPhase::InputExhausted {
+            self.state.phase = PlaybackPhase::Draining(DrainingState::new());
+            self.channels.audio(DecoderEffect::Drain);
+            self.channels.video(DecoderEffect::Drain);
+        }
+        self.snapshot();
+
+        match self.state.mode {
+            PlaybackMode::Playing => {
+                self.channels.ab(AbEffect::Output(true));
+                self.channels.vo(VoEffect::Present);
+                self.channels.vo(VoEffect::Output(true));
             }
+            PlaybackMode::Paused => {
+                self.channels.vo(VoEffect::Present);
+            }
+        }
+    }
+
+    fn switch_track(
+        &mut self,
+        event_rx: &Receiver<PlayerEvent>,
+        id: TrackId,
+        kind: TrackKind,
+        params: Parameters,
+        time_base: Rational,
+    ) {
+        self.state.operation = PlaybackOperation::SwitchingTrack { kind, id };
+        self.snapshot();
+
+        match kind {
+            TrackKind::Audio => {
+                self.shared.clock.active.store(false, Relaxed);
+                self.channels.ab(AbEffect::Output(false));
+            }
+            TrackKind::Video | TrackKind::Subtitle => {}
+        }
+
+        let (seek_tx, seek_rx) = bounded(1);
+
+        self.channels
+            .demuxer(DemuxerEffect::SwitchStream { seek_tx, kind, id });
+        self.wait_for(event_rx, &seek_rx);
+        self.state.phase = PlaybackPhase::Active;
+        self.snapshot();
+
+        match kind {
+            TrackKind::Audio => {
+                let (dec_flush_tx, dec_flush_rx) = bounded(1);
+
+                self.channels.audio(DecoderEffect::Flush(dec_flush_tx));
+                self.wait_for(event_rx, &dec_flush_rx);
+
+                let (out_flush_tx, out_flush_rx) = bounded(1);
+
+                self.channels.ab(AbEffect::FlushConsumers(out_flush_tx));
+                self.wait_for(event_rx, &out_flush_rx);
+
+                let (dec_reinit_tx, dec_reinit_rx) = bounded(1);
+
+                self.channels
+                    .audio(DecoderEffect::Reinit(dec_reinit_tx, params, time_base));
+                let resp = self.wait_for(event_rx, &dec_reinit_rx);
+                let ReinitDetails::Audio { rate } = resp.1 else {
+                    unreachable!("Audio decoder returned invalid details");
+                };
+
+                self.channels.ab(AbEffect::Reinit(rate));
+
+                let (sync_tx, sync_rx) = bounded(1);
+
+                let sync = SyncMode::FollowClock;
+                self.channels.audio(DecoderEffect::Sync(sync_tx, sync));
+                self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
+                self.wait_for(event_rx, &sync_rx);
+
+                self.shared
+                    .clock
+                    .active
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.state.tracks.audio = Some(id);
+                if self.state.mode == PlaybackMode::Playing {
+                    self.channels.ab(AbEffect::Output(true));
+                }
+                self.state.operation = PlaybackOperation::None;
+                if self.state.phase == PlaybackPhase::InputExhausted {
+                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
+                    self.channels.audio(DecoderEffect::Drain);
+                    self.channels.video(DecoderEffect::Drain);
+                }
+                self.snapshot();
+                (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
+            }
+            TrackKind::Video => {
+                let (dec_flush_tx, dec_flush_rx) = bounded(1);
+
+                self.channels.video(DecoderEffect::Flush(dec_flush_tx));
+                self.wait_for(event_rx, &dec_flush_rx);
+
+                let (out_flush_tx, out_flush_rx) = bounded(1);
+
+                self.channels.vo(VoEffect::FlushConsumers(out_flush_tx));
+                self.wait_for(event_rx, &out_flush_rx);
+
+                let (dec_reinit_tx, dec_reinit_rx) = bounded(1);
+
+                self.channels.video(DecoderEffect::Reinit(
+                    dec_reinit_tx,
+                    params.clone(),
+                    time_base,
+                ));
+                self.wait_for(event_rx, &dec_reinit_rx);
+
+                let (sync_tx, sync_rx) = bounded(1);
+
+                let sync = SyncMode::FollowClock;
+                self.channels.video(DecoderEffect::Sync(sync_tx, sync));
+                self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
+                self.wait_for(event_rx, &sync_rx);
+
+                self.state.tracks.video = Some(id);
+                if self.state.mode == PlaybackMode::Paused {
+                    self.channels.vo(VoEffect::Present);
+                }
+                self.state.operation = PlaybackOperation::None;
+                if self.state.phase == PlaybackPhase::InputExhausted {
+                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
+                    self.channels.audio(DecoderEffect::Drain);
+                    self.channels.video(DecoderEffect::Drain);
+                }
+                self.snapshot();
+                (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
+            }
+            TrackKind::Subtitle => {
+                let (dec_flush_tx, dec_flush_rx) = bounded(1);
+
+                self.channels.sub(DecoderEffect::Flush(dec_flush_tx));
+                self.wait_for(event_rx, &dec_flush_rx);
+
+                let (dec_reinit_tx, dec_reinit_rx) = bounded(1);
+
+                self.channels.sub(DecoderEffect::Reinit(
+                    dec_reinit_tx,
+                    params.clone(),
+                    time_base,
+                ));
+                self.wait_for(event_rx, &dec_reinit_rx);
+
+                let (sync_tx, sync_rx) = bounded(1);
+
+                let sync = SyncMode::FollowClock;
+                self.channels.sub(DecoderEffect::Sync(sync_tx, sync));
+                self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
+                self.wait_for(event_rx, &sync_rx);
+
+                self.state.tracks.subs = Some(id);
+                self.state.operation = PlaybackOperation::None;
+                if self.state.phase == PlaybackPhase::InputExhausted {
+                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
+                    self.channels.audio(DecoderEffect::Drain);
+                    self.channels.video(DecoderEffect::Drain);
+                }
+                self.snapshot();
+                (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
+            }
+        }
+        if !self.state.is_busy() && self.state.phase == PlaybackPhase::InputExhausted {
+            self.state.phase = PlaybackPhase::Draining(DrainingState::new());
+            self.snapshot();
+            self.channels.audio(DecoderEffect::Drain);
+            self.channels.video(DecoderEffect::Drain);
         }
     }
 
     fn apply_internal(&mut self, event: InternalEvent) {
         match event {
-            InternalEvent::DemuxerSeeked => {
-                if self.operation != PlaybackOperation::None {
-                    self.phase = PlaybackPhase::Active;
-                }
-                match self.operation {
-                    PlaybackOperation::Seeking(_) => {
-                        self.channels.audio(DecoderEffect::Flush);
-                        self.channels.video(DecoderEffect::Flush);
-                        self.channels.sub(DecoderEffect::Flush);
-                    }
-                    PlaybackOperation::SwitchingTrack { id, .. } => {
-                        if let Some(track) = self.meta.get_track(id) {
-                            match track.kind {
-                                TrackKind::Audio => {
-                                    self.channels.audio(DecoderEffect::Reinit(
-                                        track.params.clone(),
-                                        track.time_base,
-                                    ));
-                                    self.channels.audio(DecoderEffect::Flush);
-                                }
-                                TrackKind::Video => {
-                                    self.channels.video(DecoderEffect::Flush);
-                                }
-                                TrackKind::Subtitle => {
-                                    self.channels.sub(DecoderEffect::Reinit(
-                                        track.params.clone(),
-                                        track.time_base,
-                                    ));
-                                    self.channels.sub(DecoderEffect::Flush);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            InternalEvent::Flushed(worker) => self.handle_flushed(worker),
-            InternalEvent::Synced(worker) => self.handle_synced(worker),
-            InternalEvent::Reinitialized { worker, details } => {
-                if let (Worker::AudioDecoder, ReinitDetails::Audio { rate }) = (worker, details) {
-                    self.channels.ab(AbEffect::Reinit(rate));
-                }
-            }
             InternalEvent::DemuxerEof => {
-                self.phase = PlaybackPhase::InputExhausted;
-                if self.operation == PlaybackOperation::None {
-                    self.phase = PlaybackPhase::Draining(DrainingState::new());
+                self.state.phase = PlaybackPhase::InputExhausted;
+                if !self.state.is_busy() {
+                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
                     self.channels.audio(DecoderEffect::Drain);
                     self.channels.video(DecoderEffect::Drain);
                 }
+                self.snapshot();
             }
             InternalEvent::Drained(worker) => {
-                if let PlaybackPhase::Draining(draining) = &mut self.phase {
-                    draining.set_state(worker, TrackDrainState::Drained);
-                    match worker {
-                        Worker::AudioDecoder | Worker::VideoDecoder => {
-                            self.channels.ab(AbEffect::DrainOutput);
-                            self.channels.vo(VoEffect::DrainOutput);
-                        }
-                        Worker::AudioOutput | Worker::VideoOutput => {
-                            match worker {
-                                Worker::AudioOutput => {
-                                    self.channels.ab(AbEffect::Output(false));
-                                }
-                                Worker::VideoOutput => {
-                                    self.channels.vo(VoEffect::Output(false));
-                                }
-                                _ => unreachable!(),
-                            }
-                            if draining.out_drained(&self.streams) {
-                                self.phase = PlaybackPhase::Eof;
-                                (self.external_callback)(ExternalEvent::Eof);
-                            }
-                        }
-                        Worker::SubDecoder => todo!(),
-                    }
+                if !matches!(self.state.phase, PlaybackPhase::Draining(_)) {
+                    return;
                 }
-            }
-        }
-    }
+                if let PlaybackPhase::Draining(draining) = &mut self.state.phase {
+                    draining.set_state(worker, TrackDrainState::Drained);
+                }
+                self.snapshot();
 
-    fn handle_flushed(&mut self, worker: Worker) {
-        match &mut self.operation {
-            PlaybackOperation::Seeking(seeking) => {
-                seeking.set_state(worker, TrackSeekState::Flushed);
                 match worker {
                     Worker::AudioDecoder | Worker::VideoDecoder => {
-                        if seeking.dec_flushed(&self.streams) {
-                            self.channels.vo(VoEffect::FlushConsumers);
-                            self.channels.ab(AbEffect::FlushConsumers);
-                        }
+                        self.channels.ab(AbEffect::DrainOutput);
+                        self.channels.vo(VoEffect::DrainOutput);
                     }
                     Worker::AudioOutput | Worker::VideoOutput => {
-                        if seeking.out_flushed(&self.streams) {
-                            self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-                            let sync = SyncMode::Target(seeking.pts);
-                            self.channels.audio(DecoderEffect::Sync(sync));
-                            self.channels.video(DecoderEffect::Sync(sync));
-                            self.channels.sub(DecoderEffect::Sync(sync));
+                        match worker {
+                            Worker::AudioOutput => {
+                                self.channels.ab(AbEffect::Output(false));
+                            }
+                            Worker::VideoOutput => {
+                                self.channels.vo(VoEffect::Output(false));
+                            }
+                            _ => unreachable!(),
+                        }
+                        let out_drained = match &self.state.phase {
+                            PlaybackPhase::Draining(draining) => {
+                                draining.out_drained(&self.state.tracks)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if out_drained {
+                            self.state.phase = PlaybackPhase::Eof;
+                            self.snapshot();
+                            (self.channels.external_callback)(ExternalEvent::Eof);
                         }
                     }
-                    Worker::SubDecoder => {}
+                    Worker::SubDecoder => todo!(),
                 }
             }
-            PlaybackOperation::SwitchingTrack { id, .. } => match worker {
-                Worker::AudioDecoder => {
-                    self.channels.ab(AbEffect::FlushConsumers);
-                }
-                Worker::SubDecoder => {
-                    self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-                    self.channels
-                        .sub(DecoderEffect::Sync(SyncMode::FollowClock));
-                }
-                Worker::AudioOutput => {
-                    self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-                    self.channels
-                        .audio(DecoderEffect::Sync(SyncMode::FollowClock));
-                }
-                Worker::VideoDecoder => {
-                    self.channels.vo(VoEffect::FlushConsumers);
-                }
-                Worker::VideoOutput => {
-                    if let Some(track) = self.meta.get_track(*id) {
-                        self.channels
-                            .video(DecoderEffect::Reinit(track.params.clone(), track.time_base));
-                        self.channels
-                            .video(DecoderEffect::Sync(SyncMode::FollowClock));
-                    }
-                    self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-                }
-            },
-            _ => {}
         }
     }
 
-    fn handle_synced(&mut self, worker: Worker) {
-        match &mut self.operation {
-            PlaybackOperation::Seeking(seeking) => {
-                seeking.set_state(worker, TrackSeekState::Synced);
-                if seeking.dec_synced(&self.streams)
-                    && matches!(worker, Worker::AudioDecoder | Worker::VideoDecoder)
-                {
-                    self.operation = PlaybackOperation::None;
-                    if self.phase == PlaybackPhase::InputExhausted {
-                        self.phase = PlaybackPhase::Draining(DrainingState::new());
-                        self.channels.audio(DecoderEffect::Drain);
-                        self.channels.video(DecoderEffect::Drain);
-                    }
-                    match self.mode {
-                        PlaybackMode::Playing => {
-                            self.channels.ab(AbEffect::Output(true));
-                            self.channels.vo(VoEffect::Present);
-                            self.channels.vo(VoEffect::Output(true));
-                        }
-                        PlaybackMode::Paused => {
-                            self.channels.vo(VoEffect::Present);
-                        }
-                    }
-                }
+    fn wait_for<T>(&mut self, event_rx: &Receiver<PlayerEvent>, response_rx: &Receiver<T>) -> T {
+        loop {
+            crossbeam_channel::select! {
+                recv(event_rx) -> event => {
+                    self.apply_event(event.unwrap(), event_rx);
+                },
+                recv(response_rx) -> response => {
+                    return response.unwrap();
+                },
             }
-            PlaybackOperation::SwitchingTrack { kind, id } => {
-                match worker {
-                    Worker::AudioDecoder => {
-                        self.shared
-                            .clock
-                            .active
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        self.streams.audio = Some(*id);
-                        if self.mode == PlaybackMode::Playing {
-                            self.channels.ab(AbEffect::Output(true));
-                        }
-                        (self.external_callback)(ExternalEvent::TrackChanged(*kind, *id));
-                        self.operation = PlaybackOperation::None;
-                    }
-                    Worker::VideoDecoder => {
-                        self.channels.vo(VoEffect::Present);
-                        self.streams.video = Some(*id);
-                        (self.external_callback)(ExternalEvent::TrackChanged(*kind, *id));
-                        self.operation = PlaybackOperation::None;
-                    }
-                    Worker::SubDecoder => {
-                        self.streams.subs = Some(*id);
-                        (self.external_callback)(ExternalEvent::TrackChanged(*kind, *id));
-                        self.operation = PlaybackOperation::None;
-                    }
-                    _ => {}
-                }
-                if self.operation == PlaybackOperation::None
-                    && self.phase == PlaybackPhase::InputExhausted
-                {
-                    self.phase = PlaybackPhase::Draining(DrainingState::new());
-                    self.channels.audio(DecoderEffect::Drain);
-                    self.channels.video(DecoderEffect::Drain);
-                }
-            }
-            _ => {}
         }
-    }
-}
-
-impl std::fmt::Debug for DecoderEffect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DecoderEffect::Flush => write!(f, "Flush"),
-            DecoderEffect::Sync(mode) => write!(f, "Sync({mode:?})"),
-            DecoderEffect::Drain => write!(f, "Drain"),
-            DecoderEffect::Reinit(_, _) => write!(f, "Reinit"),
-        }
-    }
-}
-
-impl PlayerThreads {
-    pub fn new() -> Self {
-        Self {
-            demuxer: None,
-            audio_decoder: None,
-            audio_backend: None,
-            video_decoder: None,
-            video_output: None,
-            sub_decoder: None,
-        }
-    }
-}
-
-impl Default for PlayerThreads {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -477,118 +470,4 @@ impl Drop for PlayerThreads {
             thread.join().ok();
         }
     }
-}
-
-fn open(
-    path: &str,
-    shared: &SharedPlayerState,
-    external_callback: &ExternalCallback,
-    event_tx: &Sender<PlayerEvent>,
-) -> Result<(ActiveTracks, PlayerChannels, PlayerThreads, PlayerMeta), EngineError> {
-    let ictx = input(&path)?;
-    let mut channels = PlayerChannels::new();
-    let mut threads = PlayerThreads::new();
-    channels.external_callback = Some(external_callback.clone());
-
-    let audio_stream = ictx.streams().best(Type::Audio);
-    let video_stream = ictx.streams().best(Type::Video);
-    let sub_stream = ictx.streams().best(Type::Subtitle);
-
-    let meta = PlayerMeta::new(&ictx);
-
-    let mut audio_idx = None;
-    let mut video_idx = None;
-    let mut sub_idx = None;
-
-    if let Some(audio_stream) = audio_stream {
-        audio_idx = Some(audio_stream.index());
-        let (dec_handle, ab_handle, dec_effect_tx, pw_tx, packet_tx) = spawn_audio_stream(
-            &audio_stream,
-            event_tx,
-            external_callback,
-            &shared.audio_info.volume,
-            shared.clock.clone(),
-            path,
-        );
-
-        channels.audio_tx = Some(dec_effect_tx);
-        channels.pw_tx = Some(pw_tx);
-        channels.audio_packet_tx = Some(packet_tx);
-        channels.audio_clock = Some(shared.clock.clone());
-        shared.clock.active.store(true, Ordering::Relaxed);
-        threads.audio_decoder = Some(dec_handle);
-        threads.audio_backend = Some(ab_handle);
-    }
-
-    if let Some(video_stream) = video_stream {
-        video_idx = Some(video_stream.index());
-        let (dec_handle, output_handle, dec_tx, vo_tx, packet_tx) = spawn_video_stream(
-            &video_stream,
-            event_tx,
-            Some(external_callback),
-            &shared.config,
-            &shared.video_output.frame,
-            &shared.video_output.current_pts,
-            &shared.clock,
-        );
-        channels.video_tx = Some(dec_tx);
-        channels.video_output_tx = Some(vo_tx);
-        channels.video_packet_tx = Some(packet_tx);
-        threads.video_decoder = Some(dec_handle);
-        threads.video_output = Some(output_handle);
-    }
-
-    if let Some(sub_stream) = sub_stream {
-        sub_idx = Some(sub_stream.index());
-        let (dec_handle, sub_tx, packet_tx) = spawn_sub_stream(
-            &ictx,
-            event_tx,
-            &sub_stream,
-            shared.clock.clone(),
-            shared.sub_output.track.clone(),
-            shared.sub_output.renderer.clone(),
-        );
-        channels.sub_tx = Some(sub_tx);
-        channels.sub_packet_tx = Some(packet_tx);
-        threads.sub_decoder = Some(dec_handle);
-    }
-
-    let demuxer_event_tx = event_tx.clone();
-    let (demuxer_tx, demuxer_rx) = crossbeam_channel::unbounded();
-    let demuxer_waker = Arc::new(ThreadWaker::new());
-    let memory_budget = MemoryBudget::new(150 * 1024 * 1024, demuxer_waker.clone());
-    channels.demuxer_tx = Some(demuxer_tx);
-    let mut demuxer = Demuxer::new(
-        ictx,
-        video_idx,
-        audio_idx,
-        sub_idx,
-        channels.video_packet_tx.clone(),
-        channels.audio_packet_tx.clone(),
-        channels.sub_packet_tx.clone(),
-        demuxer_rx,
-        demuxer_event_tx,
-        shared.clock.clone(),
-        demuxer_waker,
-        memory_budget,
-    );
-    let demuxer_handle = std::thread::Builder::new()
-        .name("demuxer".into())
-        .spawn(move || {
-            demuxer.waker.set();
-            demuxer.read_packets();
-        })
-        .unwrap();
-    threads.demuxer = Some(demuxer_handle);
-
-    Ok((
-        ActiveTracks {
-            subs: sub_idx,
-            audio: audio_idx,
-            video: video_idx,
-        },
-        channels,
-        threads,
-        meta,
-    ))
 }

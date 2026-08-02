@@ -31,11 +31,7 @@ use crate::{
     PlayerEvent::Internal,
     audio::queue::Consumer,
     engine::{ExternalCallback, ExternalEvent, get_engine_start},
-    session::{
-        AbEffect,
-        InternalEvent::{Drained, Flushed},
-        PlayerEvent, Worker,
-    },
+    session::{AbEffect, InternalEvent::Drained, PlayerEvent, Worker},
     utils::Clock,
 };
 
@@ -104,7 +100,7 @@ pub fn spawn(
                         *recv_expected_rate.borrow_mut() = None;
                     }
                 }
-                AbEffect::FlushConsumers => {
+                AbEffect::FlushConsumers(flush_tx) => {
                     // SAFETY: This is called after AbEffect::Output(false) so
                     // it should be safe to clear the buffer.
                     // TODO need to do some more testing but so far seems to be good
@@ -114,7 +110,7 @@ pub fn spawn(
                     }
                     recv_stream.flush(false).unwrap();
                     recv_drain.store(false, Ordering::Relaxed);
-                    let _ = ab_event_tx.send(Internal(Flushed(Worker::AudioOutput)));
+                    let _ = flush_tx.send(Worker::AudioOutput);
                 }
                 AbEffect::DrainOutput => {
                     recv_drain.store(true, Ordering::Relaxed);

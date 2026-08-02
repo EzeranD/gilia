@@ -6,10 +6,7 @@ use ffmpeg_next::{Packet, Rescale, format::context::Input, media::Type};
 use crate::{
     PlayerEvent::{self, Internal},
     TrackKind,
-    session::{
-        DemuxerEffect,
-        InternalEvent::{DemuxerEof, DemuxerSeeked},
-    },
+    session::{DemuxerEffect, InternalEvent::DemuxerEof},
     utils::{Clock, MemoryBudget, ThreadWaker, TrackedPacket},
 };
 
@@ -151,49 +148,50 @@ impl Demuxer {
     }
 
     fn effect_recv(&mut self, effect: DemuxerEffect) {
-        if let DemuxerEffect::SeekDemuxer(pts) = effect {
-            self.video_stream.target_dts = None;
-            self.audio_stream.target_dts = None;
-            self.sub_stream.target_dts = None;
-            self.video_stream.last_dts = None;
-            self.audio_stream.last_dts = None;
-            self.sub_stream.last_dts = None;
-            let pts_us = pts * 1000;
-            let _ = self.ictx.seek(pts_us, i64::MIN..pts_us);
-            let _ = self.event_tx.send(Internal(DemuxerSeeked));
-            if let Ok(DemuxerEffect::ResumeDemuxer) = self.effect_rx.recv() {}
-        }
-        if let DemuxerEffect::SwitchStream { kind, id } = effect {
-            let clock_ms = self.clock.get_ms();
-            match kind {
-                TrackKind::Audio => {
-                    self.audio_stream.idx = Some(id);
-                    self.audio_stream.target_dts = None;
-                    self.video_stream.target_dts = self.video_stream.last_dts;
-                    self.sub_stream.target_dts = self.sub_stream.last_dts;
-                    let pts_us = clock_ms * 1000;
-                    let _ = self.ictx.seek(pts_us, i64::MIN..pts_us);
-                }
-                TrackKind::Video => {
-                    self.video_stream.idx = Some(id);
-                    self.video_stream.target_dts = None;
-                    self.audio_stream.target_dts = self.audio_stream.last_dts;
-                    self.sub_stream.target_dts = self.sub_stream.last_dts;
-                    let pts_us = clock_ms * 1000;
-                    let _ = self.ictx.seek(pts_us, i64::MIN..pts_us);
-                }
-                TrackKind::Subtitle => {
-                    self.sub_stream.idx = Some(id);
-                    self.sub_stream.target_dts = None;
-                    self.audio_stream.target_dts = self.audio_stream.last_dts;
-                    self.video_stream.target_dts = self.video_stream.last_dts;
-                    let pts_us = clock_ms.saturating_sub(10000) * 1000;
-                    let _ = self.ictx.seek(pts_us, i64::MIN..pts_us);
-                }
+        match effect {
+            DemuxerEffect::ResumeDemuxer => {}
+            DemuxerEffect::SeekDemuxer(seek_tx, pts) => {
+                self.video_stream.target_dts = None;
+                self.audio_stream.target_dts = None;
+                self.sub_stream.target_dts = None;
+                self.video_stream.last_dts = None;
+                self.audio_stream.last_dts = None;
+                self.sub_stream.last_dts = None;
+                let pts_us = pts * 1000;
+                let _ = self.ictx.seek(pts_us, i64::MIN..pts_us);
+                let _ = seek_tx.send(());
+                if let Ok(DemuxerEffect::ResumeDemuxer) = self.effect_rx.recv() {}
             }
+            DemuxerEffect::SwitchStream { seek_tx, kind, id } => {
+                let clock_ms = self.clock.get_ms();
+                let pts_us = match kind {
+                    TrackKind::Audio => {
+                        self.audio_stream.idx = Some(id);
+                        self.audio_stream.target_dts = None;
+                        self.video_stream.target_dts = self.video_stream.last_dts;
+                        self.sub_stream.target_dts = self.sub_stream.last_dts;
+                        clock_ms * 1000
+                    }
+                    TrackKind::Video => {
+                        self.video_stream.idx = Some(id);
+                        self.video_stream.target_dts = None;
+                        self.audio_stream.target_dts = self.audio_stream.last_dts;
+                        self.sub_stream.target_dts = self.sub_stream.last_dts;
+                        clock_ms * 1000
+                    }
+                    TrackKind::Subtitle => {
+                        self.sub_stream.idx = Some(id);
+                        self.sub_stream.target_dts = None;
+                        self.audio_stream.target_dts = self.audio_stream.last_dts;
+                        self.video_stream.target_dts = self.video_stream.last_dts;
+                        clock_ms.saturating_sub(10000) * 1000
+                    }
+                };
+                let _ = self.ictx.seek(pts_us, i64::MIN..pts_us);
 
-            let _ = self.event_tx.send(Internal(DemuxerSeeked));
-            if let Ok(DemuxerEffect::ResumeDemuxer) = self.effect_rx.recv() {}
+                let _ = seek_tx.send(());
+                if let Ok(DemuxerEffect::ResumeDemuxer) = self.effect_rx.recv() {}
+            }
         }
     }
 }

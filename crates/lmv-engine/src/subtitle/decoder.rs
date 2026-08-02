@@ -10,12 +10,7 @@ use libass::{Change, Layer};
 use tracing::warn;
 
 use crate::{
-    PlayerEvent::Internal,
-    session::{
-        DecoderEffect,
-        InternalEvent::{Flushed, Synced},
-        PlayerEvent, SyncMode, Worker,
-    },
+    session::{DecoderEffect, PlayerEvent, ReinitDetails, SyncMode, Worker},
     utils::{Clock, TrackedPacket},
 };
 
@@ -149,20 +144,20 @@ impl SubtitleDecoder {
     }
     fn effect_recv(&mut self, effect: DecoderEffect) {
         match effect {
-            DecoderEffect::Flush => {
+            DecoderEffect::Flush(flush_tx) => {
                 while self.packet_tx.try_recv().is_ok() {}
                 self.decoder.flush();
                 self.sync_mode = None;
                 if let Some(track) = &mut *self.track.lock().unwrap() {
                     track.flush_events();
                 }
-                let _ = self.event_tx.send(Internal(Flushed(Worker::SubDecoder)));
+                let _ = flush_tx.send(Worker::SubDecoder);
             }
-            DecoderEffect::Sync(mode) => {
+            DecoderEffect::Sync(sync_tx, mode) => {
                 self.sync_mode = Some(mode);
-                let _ = self.event_tx.send(Internal(Synced(Worker::SubDecoder)));
+                let _ = sync_tx.send(Worker::SubDecoder);
             }
-            DecoderEffect::Reinit(parameters, time_base) => {
+            DecoderEffect::Reinit(reinit_tx, parameters, time_base) => {
                 let context = Context::from_parameters(parameters).unwrap();
                 let ptr = unsafe { context.as_ptr() };
                 if let Ok(decoder) = context.decoder().subtitle() {
@@ -185,6 +180,7 @@ impl SubtitleDecoder {
                     }
                 }
                 *self.track.lock().unwrap() = Some(track);
+                let _ = reinit_tx.send((Worker::SubDecoder, ReinitDetails::None));
             }
             // TODO work on these when we dont use libass for everything for now it doesnt hurt having these do nothing
             DecoderEffect::Drain => {}

@@ -10,12 +10,9 @@ use tracing::error;
 
 use crate::{
     TrackKind,
-    session::{
-        AbEffect, ActiveTracks, DecoderEffect, DemuxerEffect, PlaybackMode, PlaybackOperation,
-        PlaybackPhase, PlayerEvent, PlayerMeta, PlayerSession, PlayerSnapshot, TrackId, VoEffect,
-    },
+    session::{ActiveTracks, PlayerEvent, PlayerMeta, PlayerSession, SessionState, TrackId},
     subtitle::decoder::SubtitleFrame,
-    utils::{Clock, TrackedPacket, WakingSender},
+    utils::Clock,
     video::frame::VideoFrame,
 };
 
@@ -39,7 +36,7 @@ pub type ExternalCallback = Arc<dyn Fn(ExternalEvent) + Send + Sync>;
 
 pub struct PlayerEngine {
     pub config: Arc<EngineConfig>,
-    pub state: Arc<ArcSwap<PlayerSnapshot>>,
+    pub state: Arc<ArcSwap<SessionState>>,
     pub clock: Arc<Clock>,
     external_callback: ExternalCallback,
     event_tx: Option<Sender<PlayerEvent>>,
@@ -95,16 +92,11 @@ impl PlayerEngine {
         let external_callback = Arc::new(callback);
         Self {
             config: Arc::new(config),
-            state: Arc::new(ArcSwap::from_pointee(PlayerSnapshot {
-                mode: PlaybackMode::Playing,
-                operation: PlaybackOperation::None,
-                phase: PlaybackPhase::Active,
-                active_tracks: ActiveTracks {
-                    audio: None,
-                    video: None,
-                    subs: None,
-                },
-            })),
+            state: Arc::new(ArcSwap::from_pointee(SessionState::new(ActiveTracks {
+                audio: None,
+                video: None,
+                subs: None,
+            }))),
             clock: Arc::new(Clock::default()),
             external_callback,
             event_tx: None,
@@ -139,13 +131,17 @@ impl PlayerEngine {
         let _ = thread::Builder::new()
             .name("session".into())
             .spawn(move || {
-                match PlayerSession::open(&path, shared, &external_callback, event_tx_clone) {
+                match PlayerSession::open(
+                    &path,
+                    shared,
+                    &external_callback,
+                    event_tx_clone,
+                    session_state.clone(),
+                ) {
                     Ok(mut session) => {
-                        session_state.store(Arc::new(session.snapshot()));
                         external_callback(ExternalEvent::Opened(session.meta.clone()));
                         while let Ok(event) = event_rx.recv() {
-                            session.apply_event(event);
-                            session_state.store(Arc::new(session.snapshot()));
+                            session.apply_event(event, &event_rx);
                         }
                     }
                     Err(e) => {
@@ -167,7 +163,7 @@ impl PlayerEngine {
     }
 
     pub fn active_tracks(&self) -> ActiveTracks {
-        self.state.load().active_tracks
+        self.state.load().tracks
     }
 
     pub fn frame(&self) -> Option<VideoFrame> {
@@ -207,68 +203,5 @@ impl PlayerEngine {
 
     pub fn position_ms(&self) -> i64 {
         self.clock.get_ms()
-    }
-}
-
-pub struct PlayerChannels {
-    pub demuxer_tx: Option<Sender<DemuxerEffect>>,
-    pub audio_tx: Option<WakingSender<DecoderEffect>>,
-    pub audio_packet_tx: Option<Sender<TrackedPacket>>,
-    pub pw_tx: Option<pipewire::channel::Sender<AbEffect>>,
-    pub video_tx: Option<Sender<DecoderEffect>>,
-    pub video_packet_tx: Option<Sender<TrackedPacket>>,
-    pub video_output_tx: Option<Sender<VoEffect>>,
-    pub sub_tx: Option<Sender<DecoderEffect>>,
-    pub sub_packet_tx: Option<Sender<TrackedPacket>>,
-    pub external_callback: Option<ExternalCallback>,
-    pub audio_clock: Option<Arc<Clock>>,
-}
-
-impl PlayerChannels {
-    pub fn new() -> Self {
-        Self {
-            demuxer_tx: None,
-            audio_tx: None,
-            audio_packet_tx: None,
-            pw_tx: None,
-            video_output_tx: None,
-            video_tx: None,
-            video_packet_tx: None,
-            sub_tx: None,
-            sub_packet_tx: None,
-            external_callback: None,
-            audio_clock: None,
-        }
-    }
-
-    pub fn ab(&self, effect: AbEffect) {
-        if let Some(tx) = &self.pw_tx {
-            let _ = tx.send(effect);
-        }
-    }
-    pub fn demuxer(&self, effect: DemuxerEffect) {
-        if let Some(tx) = &self.demuxer_tx {
-            let _ = tx.send(effect);
-        }
-    }
-    pub fn audio(&self, effect: DecoderEffect) {
-        if let Some(tx) = &self.audio_tx {
-            let _ = tx.send(effect);
-        }
-    }
-    pub fn video(&self, effect: DecoderEffect) {
-        if let Some(tx) = &self.video_tx {
-            let _ = tx.send(effect);
-        }
-    }
-    pub fn sub(&self, effect: DecoderEffect) {
-        if let Some(tx) = &self.sub_tx {
-            let _ = tx.send(effect);
-        }
-    }
-    pub fn vo(&self, effect: VoEffect) {
-        if let Some(tx) = &self.video_output_tx {
-            let _ = tx.send(effect);
-        }
     }
 }

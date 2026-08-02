@@ -16,9 +16,7 @@ use crate::{
     PlayerEvent::Internal,
     engine::EngineConfig,
     session::{
-        DecoderEffect,
-        InternalEvent::{Drained, Flushed, Synced},
-        PlayerEvent, SyncMode, Worker,
+        DecoderEffect, InternalEvent::Drained, PlayerEvent, ReinitDetails, SyncMode, Worker,
     },
     utils::{Clock, TrackedPacket},
     video::hw_ffmpeg::{HwOption, ManagedVideo, create_decoder, get_hw_options},
@@ -27,6 +25,12 @@ use crate::{
 pub struct VideoDecoder {
     ctx: VideoContext,
     state: DecoderState,
+}
+
+#[derive(Debug)]
+pub struct PendingSync {
+    tx: Sender<Worker>,
+    mode: SyncMode,
 }
 
 pub struct VideoContext {
@@ -46,10 +50,10 @@ pub struct VideoContext {
 pub enum DecoderState {
     Creating {
         packets: Vec<TrackedPacket>,
-        sync: Option<SyncMode>,
+        sync: Option<PendingSync>,
     },
     Active,
-    Syncing(SyncMode),
+    Syncing(Sender<Worker>, SyncMode),
     Draining,
     Idle,
 }
@@ -93,7 +97,7 @@ impl VideoDecoder {
         loop {
             match state {
                 DecoderState::Creating { packets, sync } => {
-                    ctx.init_decoder(packets, *sync);
+                    ctx.init_decoder(packets, sync.as_ref());
                     *state = DecoderState::Active;
                     debug!("State changed: {:?}", state);
                 }
@@ -106,7 +110,7 @@ impl VideoDecoder {
                         recv(ctx.packet_tx) -> packet => ctx.decode(state, &packet.unwrap())
                     }
                 }
-                DecoderState::Syncing(_) => {
+                DecoderState::Syncing(_, _) => {
                     select_biased! {
                         recv(ctx.effect_rx) -> effect => {
                             let effect = effect.unwrap();
@@ -146,13 +150,17 @@ impl VideoDecoder {
 }
 
 impl VideoContext {
-    fn init_decoder(&mut self, packets: &mut Vec<TrackedPacket>, sync: Option<SyncMode>) {
+    fn init_decoder(
+        &mut self,
+        packets: &mut Vec<TrackedPacket>,
+        pending_sync: Option<&PendingSync>,
+    ) {
         if self.config.hw_dec {
             let parameters = self.parameters.clone();
             let mut hw_options = get_hw_options(&parameters);
             for hw_option in &mut hw_options {
                 debug!("hw_cfg: {:?}", hw_option.hw_cfg);
-                if let Some(decoder) = self.init_hw(hw_option, packets, sync) {
+                if let Some(decoder) = self.init_hw(hw_option, packets, pending_sync) {
                     self.decoder = Some(decoder);
                     break;
                 }
@@ -169,6 +177,7 @@ impl VideoContext {
                     .unwrap(),
             );
             self.mode = DecoderMode::Sw;
+            let sync = pending_sync.as_ref().map(|pending| pending.mode);
             let mut synced = false;
             for packet in packets {
                 if let Err(e) = decoder.send_packet(packet) {
@@ -183,8 +192,10 @@ impl VideoContext {
                         continue;
                     }
 
-                    if sync.is_some() && !synced {
-                        let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                    if let Some(pending_sync) = pending_sync.as_ref()
+                        && !synced
+                    {
+                        let _ = pending_sync.tx.send(Worker::VideoDecoder);
                         synced = true;
                     }
 
@@ -192,8 +203,10 @@ impl VideoContext {
                     let _ = self.frame_tx.send(frame);
                 }
             }
-            if sync.is_some() && !synced {
-                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+            if let Some(pending_sync) = pending_sync.as_ref()
+                && !synced
+            {
+                let _ = pending_sync.tx.send(Worker::VideoDecoder);
             }
             self.decoder = Some(decoder);
         }
@@ -203,8 +216,9 @@ impl VideoContext {
         &mut self,
         hw_option: &HwOption,
         packets: &mut Vec<TrackedPacket>,
-        sync: Option<SyncMode>,
+        pending_sync: Option<&PendingSync>,
     ) -> Option<ManagedVideo> {
+        let sync = pending_sync.map(|pending| pending.mode);
         let initialized = Arc::new(AtomicBool::new(false));
         let mut decoder = create_decoder(&self.parameters, initialized.clone(), hw_option);
         let mut i = 0;
@@ -237,8 +251,10 @@ impl VideoContext {
                         let skip = self.should_skip(pts, sync);
 
                         if !skip {
-                            if sync.is_some() && !synced {
-                                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                            if let Some(pending_sync) = pending_sync
+                                && !synced
+                            {
+                                let _ = pending_sync.tx.send(Worker::VideoDecoder);
                                 synced = true;
                             }
                             let frame = wrap_frame(src_frame, pts, self.mode, &mut self.printed);
@@ -254,8 +270,10 @@ impl VideoContext {
                                 continue;
                             }
 
-                            if sync.is_some() && !synced {
-                                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                            if let Some(pending_sync) = pending_sync
+                                && !synced
+                            {
+                                let _ = pending_sync.tx.send(Worker::VideoDecoder);
                                 synced = true;
                             }
 
@@ -276,9 +294,10 @@ impl VideoContext {
                                     continue;
                                 }
 
-                                if sync.is_some() && !synced {
-                                    let _ =
-                                        self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                                if let Some(pending_sync) = pending_sync
+                                    && !synced
+                                {
+                                    let _ = pending_sync.tx.send(Worker::VideoDecoder);
                                     synced = true;
                                 }
 
@@ -288,8 +307,10 @@ impl VideoContext {
                             }
                         }
 
-                        if sync.is_some() && !synced {
-                            let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                        if let Some(pending_sync) = pending_sync
+                            && !synced
+                        {
+                            let _ = pending_sync.tx.send(Worker::VideoDecoder);
                         }
 
                         return Some(decoder);
@@ -321,8 +342,8 @@ impl VideoContext {
     }
 
     fn sync(&mut self, state: &mut DecoderState, packet: &Packet) {
-        let mode = match state {
-            DecoderState::Syncing(mode) => *mode,
+        let (sync_tx, mode) = match state {
+            DecoderState::Syncing(sync_tx, mode) => (sync_tx.clone(), *mode),
             _ => return,
         };
 
@@ -355,7 +376,7 @@ impl VideoContext {
                 send(self.frame_tx, wrap_frame(frame, pts, self.mode, &mut self.printed)) -> _res => {},
             }
             if !synced {
-                let _ = self.event_tx.send(Internal(Synced(Worker::VideoDecoder)));
+                let _ = sync_tx.send(Worker::VideoDecoder);
                 if let Some(decoder) = &mut self.decoder {
                     decoder.skip_frame(ffmpeg_next::Discard::Default);
                 }
@@ -395,22 +416,22 @@ impl VideoContext {
 
     fn effect_recv(&mut self, effect: DecoderEffect, state: &mut DecoderState) {
         match effect {
-            DecoderEffect::Flush => {
+            DecoderEffect::Flush(flush_tx) => {
                 while self.packet_tx.try_recv().is_ok() {}
                 if let Some(decoder) = &mut self.decoder {
                     decoder.flush();
                 }
                 *state = DecoderState::Idle;
-                let _ = self.event_tx.send(Internal(Flushed(Worker::VideoDecoder)));
+                let _ = flush_tx.send(Worker::VideoDecoder);
             }
-            DecoderEffect::Sync(mode) => {
+            DecoderEffect::Sync(sync_tx, mode) => {
                 if let Some(decoder) = &mut self.decoder {
                     decoder.skip_frame(ffmpeg_next::Discard::NonReference);
-                    *state = DecoderState::Syncing(mode);
+                    *state = DecoderState::Syncing(sync_tx, mode);
                 } else {
                     *state = DecoderState::Creating {
                         packets: Vec::new(),
-                        sync: Some(mode),
+                        sync: Some(PendingSync { tx: sync_tx, mode }),
                     };
                 }
             }
@@ -418,12 +439,13 @@ impl VideoContext {
                 *state = DecoderState::Draining;
                 tracing::debug!("State changed: {:?}", state);
             }
-            DecoderEffect::Reinit(parameters, time_base) => {
+            DecoderEffect::Reinit(reinit_tx, parameters, time_base) => {
                 self.parameters = parameters;
                 self.time_base = time_base;
                 self.printed = false;
                 self.decoder = None;
                 *state = DecoderState::Idle;
+                let _ = reinit_tx.send((Worker::VideoDecoder, ReinitDetails::None));
             }
         }
     }
@@ -438,7 +460,7 @@ impl std::fmt::Debug for DecoderState {
                 .field("sync", sync)
                 .finish(),
             DecoderState::Active => write!(f, "Active"),
-            DecoderState::Syncing(target) => write!(f, "Syncing({target:?})"),
+            DecoderState::Syncing(sender, target) => write!(f, "Syncing({sender:?}, {target:?})"),
             DecoderState::Draining => write!(f, "Draining"),
             DecoderState::Idle => write!(f, "Idle"),
         }

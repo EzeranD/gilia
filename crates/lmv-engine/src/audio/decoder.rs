@@ -15,9 +15,7 @@ use crate::{
     PlayerEvent::Internal,
     audio::queue::{AudioBlock, Producer, PushError},
     session::{
-        DecoderEffect,
-        InternalEvent::{Drained, Flushed, Reinitialized, Synced},
-        PlayerEvent, ReinitDetails, SyncMode, Worker,
+        DecoderEffect, InternalEvent::Drained, PlayerEvent, ReinitDetails, SyncMode, Worker,
     },
     utils::{Clock, TrackedPacket},
 };
@@ -34,10 +32,10 @@ pub struct AudioDecoder {
     state: DecoderState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum DecoderState {
     Active,
-    Syncing(SyncMode),
+    Syncing(Sender<Worker>, SyncMode),
     Draining,
     Idle,
 }
@@ -94,13 +92,13 @@ impl AudioDecoder {
                         }
                     }
                 }
-                DecoderState::Syncing(mode) => {
+                DecoderState::Syncing(ref sync_tx, mode) => {
                     crossbeam_channel::select_biased! {
                         recv(self.effect_rx) -> effect => {
                             self.effect_recv(effect.unwrap());
                         }
                         recv(self.packet_tx) -> packet => {
-                            self.sync(&packet.unwrap(), mode);
+                            self.sync(&packet.unwrap(), sync_tx.clone(), mode);
                         }
                     }
                 }
@@ -168,7 +166,7 @@ impl AudioDecoder {
         }
     }
 
-    fn sync(&mut self, packet: &Packet, mode: SyncMode) {
+    fn sync(&mut self, packet: &Packet, seek_tx: Sender<Worker>, mode: SyncMode) {
         let mut packet_pts = packet
             .pts()
             .map(|ts| ts.rescale(self.time_base, (1, 1000)))
@@ -212,7 +210,7 @@ impl AudioDecoder {
                 PushBlockResult::Disconnected => return,
             }
             if !synced {
-                let _ = self.event_tx.send(Internal(Synced(Worker::AudioDecoder)));
+                let _ = seek_tx.send(Worker::AudioDecoder);
                 synced = true;
             }
         }
@@ -247,20 +245,20 @@ impl AudioDecoder {
 
     fn effect_recv(&mut self, effect: DecoderEffect) {
         match effect {
-            DecoderEffect::Flush => {
+            DecoderEffect::Flush(flush_tx) => {
                 while self.packet_tx.try_recv().is_ok() {}
                 self.decoder.flush();
                 self.state = DecoderState::Idle;
-                let _ = self.event_tx.send(Internal(Flushed(Worker::AudioDecoder)));
+                let _ = flush_tx.send(Worker::AudioDecoder);
             }
-            DecoderEffect::Sync(mode) => {
-                self.state = DecoderState::Syncing(mode);
+            DecoderEffect::Sync(sync_tx, mode) => {
+                self.state = DecoderState::Syncing(sync_tx, mode);
             }
             DecoderEffect::Drain => {
                 self.state = DecoderState::Draining;
                 debug!("State changed: {:?}", self.state);
             }
-            DecoderEffect::Reinit(params, time_base) => {
+            DecoderEffect::Reinit(reinit_tx, params, time_base) => {
                 let audio_context = Context::from_parameters(params).unwrap();
                 self.decoder = audio_context.decoder().audio().unwrap();
                 self.time_base = time_base;
@@ -277,12 +275,12 @@ impl AudioDecoder {
                     ),
                 )
                 .unwrap();
-                let _ = self.event_tx.send(Internal(Reinitialized {
-                    worker: Worker::AudioDecoder,
-                    details: ReinitDetails::Audio {
+                let _ = reinit_tx.send((
+                    Worker::AudioDecoder,
+                    ReinitDetails::Audio {
                         rate: self.decoder.rate(),
                     },
-                }));
+                ));
             }
         }
     }

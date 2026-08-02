@@ -3,11 +3,11 @@ use super::TrackId;
 pub type Pts = i64;
 
 #[derive(Debug, Clone, Copy)]
-pub struct PlayerSnapshot {
+pub struct SessionState {
     pub mode: PlaybackMode,
     pub operation: PlaybackOperation,
     pub phase: PlaybackPhase,
-    pub active_tracks: ActiveTracks,
+    pub tracks: ActiveTracks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,6 +56,7 @@ pub struct SeekingState {
     pub pts: Pts,
     pub audio_dec: TrackSeekState,
     pub video_dec: TrackSeekState,
+    pub sub_dec: TrackSeekState,
     pub audio_out: TrackSeekState,
     pub video_out: TrackSeekState,
 }
@@ -77,12 +78,27 @@ pub enum Worker {
     VideoOutput,
 }
 
+impl SessionState {
+    pub fn new(tracks: ActiveTracks) -> Self {
+        Self {
+            mode: PlaybackMode::Playing,
+            operation: PlaybackOperation::None,
+            phase: PlaybackPhase::Active,
+            tracks,
+        }
+    }
+    pub fn is_busy(&self) -> bool {
+        self.operation != PlaybackOperation::None
+    }
+}
+
 impl SeekingState {
     pub fn new(pts: Pts) -> Self {
         Self {
             pts,
             audio_dec: TrackSeekState::NeedsFlush,
             video_dec: TrackSeekState::NeedsFlush,
+            sub_dec: TrackSeekState::NeedsFlush,
             audio_out: TrackSeekState::NeedsFlush,
             video_out: TrackSeekState::NeedsFlush,
         }
@@ -94,7 +110,7 @@ impl SeekingState {
             Worker::VideoDecoder => self.video_dec = state,
             Worker::AudioOutput => self.audio_out = state,
             Worker::VideoOutput => self.video_out = state,
-            Worker::SubDecoder => {}
+            Worker::SubDecoder => self.sub_dec = state,
         }
     }
 
@@ -103,7 +119,8 @@ impl SeekingState {
             streams.audio.is_none() || matches!(self.audio_dec, TrackSeekState::Flushed);
         let video_done =
             streams.video.is_none() || matches!(self.video_dec, TrackSeekState::Flushed);
-        audio_done && video_done
+        let sub_done = streams.subs.is_none() || matches!(self.sub_dec, TrackSeekState::Flushed);
+        audio_done && video_done && sub_done
     }
 
     pub fn out_flushed(&self, streams: &ActiveTracks) -> bool {
@@ -119,7 +136,8 @@ impl SeekingState {
             streams.audio.is_none() || matches!(self.audio_dec, TrackSeekState::Synced);
         let video_done =
             streams.video.is_none() || matches!(self.video_dec, TrackSeekState::Synced);
-        audio_done && video_done
+        let sub_done = streams.subs.is_none() || matches!(self.sub_dec, TrackSeekState::Synced);
+        audio_done && video_done && sub_done
     }
 }
 
