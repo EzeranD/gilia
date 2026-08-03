@@ -52,6 +52,20 @@ pub fn get_hw_options(parameters: &Parameters) -> Vec<HwOption> {
             break;
         }
 
+        #[cfg(target_os = "linux")]
+        if !matches!(
+            hw_device,
+            ffmsys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
+                | ffmsys::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN
+        ) {
+            continue;
+        }
+
+        #[cfg(target_os = "windows")]
+        if !matches!(hw_device, ffmsys::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN) {
+            continue;
+        }
+
         let Ok(hw_device_ctx) = create_hw_device_ctx(hw_device).inspect_err(|e| debug!("{e}"))
         else {
             continue;

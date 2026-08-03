@@ -58,14 +58,16 @@ impl Player {
         self.engine.apply_event(Control(AudioMaster(active)));
     }
 
-    pub fn toggle_playback(&mut self) {
+    pub fn toggle_playback(&mut self) -> PlaybackMode {
         let state = self.engine.state.load();
         match state.mode {
             PlaybackMode::Playing => {
                 self.pause();
+                PlaybackMode::Paused
             }
             PlaybackMode::Paused => {
                 self.play();
+                PlaybackMode::Playing
             }
         }
     }

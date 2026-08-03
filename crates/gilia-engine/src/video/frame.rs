@@ -2,17 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{
-    ffi::c_void,
-    os::fd::{BorrowedFd, OwnedFd},
-    sync::Arc,
-};
+#[cfg(target_os = "linux")]
+use std::os::fd::{BorrowedFd, OwnedFd};
+use std::{ffi::c_void, sync::Arc};
 
-use ffmpeg_next::{
-    color::Space, ffi as ffmsys, ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME, format::Pixel, frame,
-};
+#[cfg(target_os = "linux")]
+use ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME;
+use ffmpeg_next::{color::Space, ffi as ffmsys, format::Pixel, frame};
 use tracing::{debug, warn};
 
+#[cfg(target_os = "linux")]
 use crate::video::hw_ffmpeg;
 
 #[derive(Debug, Clone, Copy)]
@@ -49,10 +48,16 @@ pub struct FrameInfo {
 
 #[derive(Debug, Clone)]
 pub enum GpuFrame {
-    Vaapi { planes: Vec<GpuPlane> },
-    Vulkan { images: [ash::vk::Image; 8] },
+    #[cfg(target_os = "linux")]
+    Vaapi {
+        planes: Vec<GpuPlane>,
+    },
+    Vulkan {
+        images: [ash::vk::Image; 8],
+    },
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct GpuPlane {
     pub fd: OwnedFd,
@@ -151,6 +156,7 @@ fn handle_sw_frame(frame: frame::Video, pts: Option<i64>) -> VideoFrame {
 fn handle_hw_frame(frame: frame::Video, pts: Option<i64>) -> VideoFrame {
     let format = frame.format();
     let gpu_frame = match format {
+        #[cfg(target_os = "linux")]
         Pixel::VAAPI => {
             let hw_frame = hw_ffmpeg::hwframe_map(AV_PIX_FMT_DRM_PRIME, &frame).unwrap();
             let mut planes = Vec::new();
@@ -304,6 +310,7 @@ impl std::fmt::Debug for Frame {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Clone for GpuPlane {
     fn clone(&self) -> Self {
         Self {

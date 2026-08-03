@@ -35,7 +35,7 @@ pub struct TrackedPacket {
     pub budget: MemoryBudget,
 }
 
-pub struct WakingSender<T> {
+pub struct UnparkSender<T> {
     tx: Sender<T>,
     waker: Arc<ThreadWaker>,
 }
@@ -45,9 +45,9 @@ pub struct ThreadWaker {
     thread: OnceLock<Thread>,
 }
 
-pub fn channel<T>(waker: Arc<ThreadWaker>) -> (WakingSender<T>, Receiver<T>) {
+pub fn unpark_channel<T>(waker: Arc<ThreadWaker>) -> (UnparkSender<T>, Receiver<T>) {
     let (tx, rx) = crossbeam_channel::unbounded();
-    (WakingSender::new(tx, waker), rx)
+    (UnparkSender { tx, waker }, rx)
 }
 
 impl Clock {
@@ -85,7 +85,7 @@ impl MemoryBudget {
     }
 
     pub fn add(&self, bytes: usize) {
-        let current = self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn sub(&self, bytes: usize) {
@@ -132,11 +132,7 @@ impl Drop for TrackedPacket {
     }
 }
 
-impl<T> WakingSender<T> {
-    pub fn new(tx: Sender<T>, waker: Arc<ThreadWaker>) -> Self {
-        Self { tx, waker }
-    }
-
+impl<T> UnparkSender<T> {
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         self.tx.send(msg)?;
         self.waker.unpark();

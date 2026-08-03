@@ -63,9 +63,6 @@ fn main() -> iced::Result {
         .with_line_number(true)
         .init();
 
-    ffmpeg_next::init().unwrap();
-    ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
-    pipewire::init();
     iced::daemon(App::boot, App::update, App::view)
         .subscription(App::subscription)
         .theme(Theme::GruvboxDark)
@@ -356,7 +353,14 @@ impl App {
     }
 
     fn adjust_volume(&mut self, change: f32) -> Task<Message> {
-        let channel1_vol = self.player.modify_volumes(|v| (v + change).clamp(0.0, 1.5));
+        let max_volume = if cfg!(target_os = "windows") {
+            1.0
+        } else {
+            1.5
+        };
+        let channel1_vol = self
+            .player
+            .modify_volumes(|v| (v + change).clamp(0.0, max_volume));
         let text = format!("Volume {}%", (channel1_vol * 100.0).round() as u32);
         self.set_text(text, Duration::from_secs(2))
     }

@@ -10,16 +10,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+#[cfg(not(target_os = "windows"))]
+use crossbeam_channel::RecvTimeoutError;
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
+#[cfg(target_os = "windows")]
+use gilia_windows::{EventRecvTimeoutError as RecvTimeoutError, MmcssRegistration, w};
 use tracing::debug;
 
 use crate::{
     ExternalEvent,
     PlayerEvent::{self, Internal},
     VideoFrame,
-    engine::ExternalCallback,
+    engine::{ExternalCallback, get_engine_start},
     session::{InternalEvent::Drained, VoEffect, Worker},
     utils::Clock,
+    video::VideoOutputReceiver,
 };
 
 pub struct VideoOutput {
@@ -28,9 +33,9 @@ pub struct VideoOutput {
     frame: Arc<Mutex<Option<VideoFrame>>>,
     current_pts: Arc<AtomicI64>,
     next_frame: Option<VideoFrame>,
-    effect_rx: Receiver<VoEffect>,
+    effect_rx: VideoOutputReceiver,
     event_tx: Sender<PlayerEvent>,
-    callback: Option<ExternalCallback>,
+    callback: ExternalCallback,
     state: OutputState,
     last_pts: Option<i64>,
     drain: bool,
@@ -54,9 +59,9 @@ impl VideoOutput {
         frame_rx: Receiver<VideoFrame>,
         frame: Arc<Mutex<Option<VideoFrame>>>,
         current_pts: Arc<AtomicI64>,
-        effect_rx: Receiver<VoEffect>,
+        effect_rx: VideoOutputReceiver,
         event_tx: Sender<PlayerEvent>,
-        callback: Option<ExternalCallback>,
+        callback: ExternalCallback,
     ) -> Self {
         Self {
             audio_clock,
@@ -74,8 +79,11 @@ impl VideoOutput {
     }
 
     pub fn process(&mut self) {
+        #[cfg(target_os = "windows")]
+        let _mmcss = MmcssRegistration::register(w!("Playback"));
+
         loop {
-            match &mut self.state {
+            match self.state {
                 OutputState::Active => match self.stage_next() {
                     StageResult::Deadline(deadline) => {
                         // TODO render subs here instead of in the widget i'm waiting till we have track switching for this
@@ -86,10 +94,9 @@ impl VideoOutput {
                                     continue;
                                 }
                                 Err(RecvTimeoutError::Timeout) => {}
-                                Err(RecvTimeoutError::Disconnected) => {
-                                    self.state = OutputState::Idle;
-                                    continue;
-                                }
+                                Err(RecvTimeoutError::Disconnected) => return,
+                                #[cfg(target_os = "windows")]
+                                Err(RecvTimeoutError::Sync { source }) => return,
                             }
                         }
                         if let Some(frame) = self.next_frame.take() {
@@ -101,18 +108,22 @@ impl VideoOutput {
                         }
                     }
                     StageResult::Empty => {
-                        if let Ok(effect) = self.effect_rx.recv_timeout(Duration::from_millis(1)) {
-                            self.effect_recv(effect);
+                        match self.effect_rx.recv_timeout(Duration::from_millis(1)) {
+                            Ok(effect) => self.effect_recv(effect),
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => return,
+                            #[cfg(target_os = "windows")]
+                            Err(RecvTimeoutError::Sync { source }) => return,
                         }
                     }
                     StageResult::Drained | StageResult::Disconnected => {
                         self.state = OutputState::Idle;
                     }
                 },
-                OutputState::Idle => {
-                    let effect = self.effect_rx.recv().unwrap();
-                    self.effect_recv(effect);
-                }
+                OutputState::Idle => match self.effect_rx.recv() {
+                    Ok(effect) => self.effect_recv(effect),
+                    Err(_) => return,
+                },
             }
         }
     }
@@ -180,13 +191,11 @@ impl VideoOutput {
         let pts = frame.info.pts.unwrap_or(0);
         self.current_pts.store(pts, Ordering::Relaxed);
         if !self.audio_clock.active.load(Ordering::Relaxed) {
-            let now = crate::engine::get_engine_start().elapsed().as_nanos() as i64;
+            let now = get_engine_start().elapsed().as_nanos() as i64;
             self.audio_clock.update(pts * 1_000_000, now);
         }
         *self.frame.lock().unwrap() = Some(frame);
-        if let Some(cb) = &self.callback {
-            cb(ExternalEvent::NewFrame);
-        }
+        (self.callback)(ExternalEvent::NewFrame);
     }
 
     fn effect_recv(&mut self, effect: VoEffect) {

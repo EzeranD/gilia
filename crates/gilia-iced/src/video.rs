@@ -185,6 +185,7 @@ impl VideoPrimitive {
     fn handle_gpu(&self, pipeline: &mut VideoPipeline, device: &Device, gpu_frame: &GpuFrame) {
         let hal_dev = unsafe { device.as_hal::<vulkan::Api>() }.unwrap();
         match gpu_frame {
+            #[cfg(target_os = "linux")]
             GpuFrame::Vaapi { planes } => {
                 for (i, plane) in planes.iter().enumerate() {
                     let plane_width = if i == 0 {

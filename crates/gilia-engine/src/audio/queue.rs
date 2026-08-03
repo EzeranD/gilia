@@ -58,6 +58,10 @@ pub fn queue(capacity: usize, waker: Arc<ThreadWaker>) -> (Producer, Consumer) {
 }
 
 impl Consumer {
+    pub fn is_empty(&self) -> bool {
+        self.inner.read.load(Ordering::Relaxed) == self.inner.write.load(Ordering::Acquire)
+    }
+
     pub fn fill(&mut self, rate: usize, buf: &mut [u8]) -> Option<(usize, i64)> {
         let stride = self.stride;
         let mut remaining = buf.len() / stride;
@@ -65,36 +69,46 @@ impl Consumer {
         let mut pts = 0;
         let mut frame_pos = 0;
 
-        while remaining > 0 {
-            if let Some(block) = self.first() {
-                let block_pos = self.block_pos.load(Ordering::Relaxed);
-                let unread = block.frames - block_pos;
-                let take = unread.min(remaining);
+        let mut read = self.inner.read.load(Ordering::Relaxed);
+        let write = self.inner.write.load(Ordering::Acquire);
+        let mut block_pos = self.block_pos.load(Ordering::Relaxed);
+        let initial_read = read;
 
-                let buf_pos = filled * stride;
-                let read_pos = block_pos * stride;
-                let take_bytes = take * stride;
+        while remaining > 0 && read != write {
+            let slot = &self.inner.queue[read & (self.inner.capacity - 1)];
+            let block = unsafe { (*slot.get()).assume_init_ref() };
 
-                buf[buf_pos..buf_pos + take_bytes]
-                    .copy_from_slice(&block.data[read_pos..read_pos + take_bytes]);
+            let unread = block.frames - block_pos;
+            let take = unread.min(remaining);
 
-                filled += take;
-                remaining -= take;
+            let buf_pos = filled * stride;
+            let read_pos = block_pos * stride;
+            let take_bytes = take * stride;
 
-                let new_block_pos = block_pos + take;
-                pts = block.pts;
-                frame_pos = new_block_pos;
+            buf[buf_pos..buf_pos + take_bytes]
+                .copy_from_slice(&block.data[read_pos..read_pos + take_bytes]);
 
-                if new_block_pos == block.frames {
-                    self.pop();
-                } else {
-                    self.block_pos.store(new_block_pos, Ordering::Relaxed);
+            filled += take;
+            remaining -= take;
+
+            block_pos += take;
+            pts = block.pts;
+            frame_pos = block_pos;
+
+            if block_pos == block.frames {
+                unsafe {
+                    (*slot.get()).assume_init_drop();
                 }
-            } else {
-                break;
+                read = read.wrapping_add(1);
+                block_pos = 0;
             }
         }
 
+        if read != initial_read {
+            self.inner.read.store(read, Ordering::Release);
+            self.waker.unpark();
+        }
+        self.block_pos.store(block_pos, Ordering::Relaxed);
         if filled == 0 {
             return None;
         }
@@ -103,52 +117,51 @@ impl Consumer {
         Some((filled, pts_ns))
     }
 
+    pub fn drain_until(&mut self, target_pts_ms: i64) -> usize {
+        let write = self.inner.write.load(Ordering::Acquire);
+        let mut read = self.inner.read.load(Ordering::Relaxed);
+        let mut drained = 0;
+
+        while read != write {
+            let slot = &self.inner.queue[read & (self.inner.capacity - 1)];
+            let block = unsafe { (*slot.get()).assume_init_ref() };
+            if block.pts < target_pts_ms {
+                unsafe {
+                    (*slot.get()).assume_init_drop();
+                }
+                read = read.wrapping_add(1);
+                drained += 1;
+            } else {
+                break;
+            }
+        }
+
+        if drained > 0 {
+            self.block_pos.store(0, Ordering::Relaxed);
+            self.inner.read.store(read, Ordering::Release);
+            self.waker.unpark();
+        }
+
+        drained
+    }
+
     /// # Safety
     ///
-    /// Must only be called when no other thread is performing `first()` or `pop()`.
+    /// Must only be called when no other thread is performing queue reads.
     pub unsafe fn clear(&self) {
         let write = self.inner.write.load(Ordering::Acquire);
         let mut read = self.inner.read.load(Ordering::Relaxed);
 
         while read != write {
+            let slot = &self.inner.queue[read & (self.inner.capacity - 1)];
             unsafe {
-                (*self.inner.queue[read & (self.inner.capacity - 1)].get()).assume_init_drop();
+                (*slot.get()).assume_init_drop();
             }
             read = read.wrapping_add(1);
         }
 
         self.inner.read.store(write, Ordering::Release);
         self.block_pos.store(0, Ordering::Relaxed);
-    }
-
-    fn first(&self) -> Option<&AudioBlock> {
-        let read = self.inner.read.load(Ordering::Relaxed);
-        let write = self.inner.write.load(Ordering::Acquire);
-
-        if read == write {
-            return None;
-        }
-        unsafe {
-            Some((*self.inner.queue[read & (self.inner.capacity - 1)].get()).assume_init_ref())
-        }
-    }
-
-    fn pop(&mut self) -> Option<AudioBlock> {
-        let read = self.inner.read.load(Ordering::Relaxed);
-        let write = self.inner.write.load(Ordering::Acquire);
-
-        if read == write {
-            return None;
-        }
-        let block = unsafe {
-            (*self.inner.queue[read & (self.inner.capacity - 1)].get()).assume_init_read()
-        };
-        self.block_pos.store(0, Ordering::Relaxed);
-        self.inner
-            .read
-            .store(read.wrapping_add(1), Ordering::Release);
-        self.waker.unpark();
-        Some(block)
     }
 }
 

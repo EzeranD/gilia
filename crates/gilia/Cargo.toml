@@ -16,8 +16,6 @@ iced = ["dep:iced", "dep:gilia-iced"]
 bin = [
   "iced",
   "dep:clap",
-  "dep:ffmpeg-next",
-  "dep:pipewire",
   "dep:time",
   "dep:tokio",
   "dep:tracing",
@@ -26,11 +24,9 @@ bin = [
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"], optional = true }
-ffmpeg-next = { workspace = true, optional = true }
 gilia-engine.workspace = true
 gilia-iced = { path = "../gilia-iced", optional = true }
 iced = { workspace = true, optional = true }
-pipewire = { workspace = true, optional = true }
 time = { version = "0.3.47", features = ["macros"], optional = true }
 tokio = { version = "1.52.3", features = ["sync", "time"], optional = true }
 tracing = { workspace = true, optional = true }

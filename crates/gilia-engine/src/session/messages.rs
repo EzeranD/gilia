@@ -4,9 +4,17 @@
 
 use crossbeam_channel::Sender;
 use ffmpeg_next::{Rational, codec::Parameters};
+#[cfg(target_os = "windows")]
+use gilia_windows::EventSendError;
 
 use super::{TrackId, TrackKind, Worker};
-use crate::{engine::ExternalCallback, session::Pts, utils::WakingSender};
+use crate::{
+    audio::AudioBackendSender,
+    engine::{EngineError, ExternalCallback, ExternalEvent},
+    session::Pts,
+    utils::UnparkSender,
+    video::VideoOutputSender,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerEvent {
@@ -87,13 +95,13 @@ pub(crate) struct SessionChannels {
 }
 
 pub(crate) struct AudioChannels {
-    pub(crate) decoder: WakingSender<DecoderEffect>,
-    pub(crate) output: pipewire::channel::Sender<AbEffect>,
+    pub(crate) decoder: UnparkSender<DecoderEffect>,
+    pub(crate) output: AudioBackendSender,
 }
 
 pub(crate) struct VideoChannels {
-    pub(crate) decoder: Sender<DecoderEffect>,
-    pub(crate) output: Sender<VoEffect>,
+    pub(crate) decoder: crossbeam_channel::Sender<DecoderEffect>,
+    pub(crate) output: VideoOutputSender,
 }
 
 pub(crate) struct SubtitleChannels {

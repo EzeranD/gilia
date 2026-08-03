@@ -12,7 +12,6 @@ authors = ["Ezeran Duchesne"]
 [workspace.dependencies]
 ffmpeg-next = "8.1.0"
 tracing = "0.1.44"
-pipewire = { version = "0.9.2", features = ["v0_3_34"] }
 ash = "0.38"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 iced = { version = "0.15.0-dev", default-features = false, features = [
@@ -22,9 +21,11 @@ iced = { version = "0.15.0-dev", default-features = false, features = [
   "advanced",
   "web-colors",
   "fira-sans",
+  "hinting",
 ] }
 libass = { git = "https://github.com/EzeranD/libass-rs" }
 gilia-engine = { version = "0.1.0", path = "crates/gilia-engine" }
+snafu = "0.9.2"
 
 [patch.crates-io]
 iced = { git = "https://github.com/EzeranD/iced", branch = "master" }

@@ -79,6 +79,7 @@ pub fn spawn(
         let recv_drain = drain_flag.clone();
         let expected_rate = Rc::new(RefCell::new(Some(rate)));
         let recv_expected_rate = expected_rate.clone();
+        let recv_event_tx = ab_event_tx.clone();
         let _receiver = ab_effect_rx.attach(mainloop.loop_(), {
             move |e| match e {
                 AbEffect::ModifyVolume(mut volumes) => {
@@ -117,7 +118,23 @@ pub fn spawn(
                     let _ = flush_tx.send(Worker::AudioOutput);
                 }
                 AbEffect::DrainOutput => {
-                    recv_drain.store(true, Ordering::Relaxed);
+                    let mut time: pipewire::sys::pw_time = unsafe { std::mem::zeroed() };
+                    let stream_empty = unsafe {
+                        pipewire::sys::pw_stream_get_time_n(
+                            recv_stream.as_raw_ptr(),
+                            &raw mut time,
+                            std::mem::size_of::<pipewire::sys::pw_time>(),
+                        ) == 0
+                            && time.queued == 0
+                            && time.buffered == 0
+                    };
+
+                    if pw_audio_buffer.is_empty() && stream_empty {
+                        let _ = recv_event_tx.send(Internal(Drained(Worker::AudioOutput)));
+                        recv_drain.store(false, Ordering::Relaxed);
+                    } else {
+                        recv_drain.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -182,6 +199,19 @@ pub fn spawn(
                     };
 
                     let rate = process_rate.load(Ordering::Relaxed);
+                    let draining = drain_flag.load(Ordering::Relaxed);
+                    if draining && audio_buffer.is_empty() {
+                        if time.queued == 0 && time.buffered == 0 {
+                            let _ = pw_event_tx.send(Internal(Drained(Worker::AudioOutput)));
+                            drain_flag.store(false, Ordering::Relaxed);
+                        }
+                        let chunk = data.chunk_mut();
+                        *chunk.offset_mut() = 0;
+                        *chunk.stride_mut() = audio_buffer.stride as i32;
+                        *chunk.size_mut() = 0;
+                        return;
+                    }
+
                     if let Some((filled, pts_ns)) = audio_buffer.fill(rate as usize, target_data) {
                         let rate = rate as i64;
                         let stride = audio_buffer.stride as i64;
@@ -199,7 +229,7 @@ pub fn spawn(
                         *chunk.stride_mut() = audio_buffer.stride as i32;
                         *chunk.size_mut() = (filled * audio_buffer.stride) as u32;
                     } else {
-                        if drain_flag.load(Ordering::Relaxed) {
+                        if draining && time.queued == 0 && time.buffered == 0 {
                             let _ = pw_event_tx.send(Internal(Drained(Worker::AudioOutput)));
                             drain_flag.store(false, Ordering::Relaxed);
                         }

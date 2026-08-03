@@ -30,13 +30,16 @@
         pkgs = nixpkgs.legacyPackages.${system};
         inherit (pkgs) lib;
 
-        rustToolchain = fenix.packages.${system}.latest.withComponents [
-          "cargo"
-          "clippy"
-          "rust-analyzer"
-          "rustc"
-          "rustfmt"
-          "rust-src"
+        rustToolchain = fenix.packages.${system}.combine [
+          (fenix.packages.${system}.latest.withComponents [
+            "cargo"
+            "clippy"
+            "rust-analyzer"
+            "rustc"
+            "rustfmt"
+            "rust-src"
+          ])
+          fenix.packages.${system}.targets.x86_64-pc-windows-gnu.latest.rust-std
         ];
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;

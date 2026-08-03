@@ -92,6 +92,9 @@ impl PlayerEngine {
     where
         F: Fn(ExternalEvent) + Send + Sync + 'static,
     {
+        ffmpeg_next::init().unwrap();
+        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
+
         get_engine_start();
         let external_callback = Arc::new(callback);
         Self {
@@ -117,6 +120,7 @@ impl PlayerEngine {
             },
         }
     }
+
     pub fn open(&mut self, path: String) -> Result<(), EngineError> {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         self.event_tx = Some(event_tx.clone());
@@ -182,12 +186,12 @@ impl PlayerEngine {
                 (widget_width - scaled.0) / 2.0,
                 (widget_height - scaled.1) / 2.0,
             );
-            renderer.set_frame_size(widget_width as i32, widget_height as i32);
+            renderer.set_frame_size(widget_width.round() as i32, widget_height.round() as i32);
             renderer.set_margins(
-                margin.1 as i32,
-                margin.1 as i32,
-                margin.0 as i32,
-                margin.0 as i32,
+                margin.1.round() as i32,
+                margin.1.round() as i32,
+                margin.0.round() as i32,
+                margin.0.round() as i32,
             );
         }
     }

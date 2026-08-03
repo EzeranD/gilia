@@ -44,18 +44,18 @@ pub fn open(
 
     if let Some(audio_stream) = audio_stream {
         audio_idx = Some(audio_stream.index());
-        let (dec_handle, ab_handle, dec_effect_tx, pw_tx, packet_tx) = spawn_audio_stream(
+        let (dec_handle, ab_handle, dec_effect_tx, ab_tx, packet_tx) = spawn_audio_stream(
             &audio_stream,
             event_tx,
             external_callback,
             &shared.audio_info.volume,
             shared.clock.clone(),
             path,
-        );
+        )?;
 
         channels.audio = Some(AudioChannels {
             decoder: dec_effect_tx,
-            output: pw_tx,
+            output: ab_tx,
         });
         audio_packet_tx = Some(packet_tx);
         shared.clock.active.store(true, Ordering::Relaxed);
@@ -68,12 +68,12 @@ pub fn open(
         let (dec_handle, output_handle, dec_tx, vo_tx, packet_tx) = spawn_video_stream(
             &video_stream,
             event_tx,
-            Some(external_callback),
+            external_callback,
             &shared.config,
             &shared.video_output.frame,
             &shared.video_output.current_pts,
             &shared.clock,
-        );
+        )?;
         channels.video = Some(VideoChannels {
             decoder: dec_tx,
             output: vo_tx,
