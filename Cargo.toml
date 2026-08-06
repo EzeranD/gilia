@@ -10,7 +10,7 @@ repository = "https://github.com/EzeranD/gilia"
 authors = ["Ezeran Duchesne"]
 
 [workspace.dependencies]
-ffmpeg-next = "8.1.0"
+ffmpeg-next = "9.0.0"
 tracing = "0.1.44"
 ash = "0.38"
 bytemuck = { version = "1.25.0", features = ["derive"] }
@@ -19,9 +19,10 @@ iced = { version = "0.15.0-dev", default-features = false, features = [
   "wgpu",
   "wayland",
   "advanced",
+  "canvas",
+  "svg",
   "web-colors",
   "fira-sans",
-  "hinting",
 ] }
 libass = { git = "https://github.com/EzeranD/libass-rs" }
 gilia-engine = { version = "0.1.0", path = "crates/gilia-engine" }

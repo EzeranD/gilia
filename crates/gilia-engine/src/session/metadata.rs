@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use ffmpeg_next::{Rational, Stream, codec::Parameters, format::context::Input, media};
+use ffmpeg_next::{Rational, Rescale, Stream, codec::Parameters, format::context::Input, media};
 
 pub type TrackId = usize;
 
@@ -11,6 +11,7 @@ pub struct PlayerMeta {
     pub duration: i64,
     pub title: Option<String>,
     pub tracks: Vec<TrackMeta>,
+    pub chapters: Vec<ChapterMeta>,
 }
 
 #[derive(Clone)]
@@ -31,6 +32,13 @@ pub enum TrackKind {
     Subtitle,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChapterMeta {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub title: Option<String>,
+}
+
 impl PlayerMeta {
     pub(super) fn new(ictx: &Input) -> Self {
         let duration = ictx.duration();
@@ -42,10 +50,21 @@ impl PlayerMeta {
             };
             tracks.push(track);
         }
+        let mut chapters: Vec<ChapterMeta> = ictx
+            .chapters()
+            .map(|chapter| ChapterMeta {
+                start_ms: chapter.start().rescale(chapter.time_base(), (1, 1000)),
+                end_ms: chapter.end().rescale(chapter.time_base(), (1, 1000)),
+                title: chapter.metadata().get("title").map(str::to_owned),
+            })
+            .collect();
+        chapters.sort_by_key(|chapter| chapter.start_ms);
+
         Self {
             duration,
             title,
             tracks,
+            chapters,
         }
     }
 

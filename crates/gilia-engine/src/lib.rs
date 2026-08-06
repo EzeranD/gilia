@@ -11,8 +11,8 @@ mod utils;
 mod video;
 
 pub use session::{
-    ActiveTracks, ControlEvent, ExternalEvent, PlaybackMode, PlaybackOperation, PlaybackPhase,
-    PlayerEvent, PlayerMeta, PlayerThreads, Session, SessionConfig, SessionError,
+    ActiveTracks, ChapterMeta, ControlEvent, ExternalEvent, PlaybackMode, PlaybackOperation,
+    PlaybackPhase, PlayerEvent, PlayerMeta, PlayerThreads, Session, SessionConfig, SessionError,
     SharedPlayerState, TrackKind, TrackMeta,
 };
 pub use subtitle::decoder::SubtitleFrame;

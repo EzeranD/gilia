@@ -29,7 +29,7 @@ pub use messages::{
     AbEffect, ControlEvent, DecoderEffect, DemuxerEffect, ExternalEvent, InternalEvent,
     PlayerEvent, ReinitDetails, SyncMode, VoEffect,
 };
-pub use metadata::{PlayerMeta, TrackId, TrackKind, TrackMeta};
+pub use metadata::{ChapterMeta, PlayerMeta, TrackId, TrackKind, TrackMeta};
 pub use state::{
     ActiveTracks, DrainingState, PlaybackMode, PlaybackOperation, PlaybackPhase, SeekingState,
     SessionState, TrackDrainState, TrackSeekState, Worker,
@@ -109,11 +109,7 @@ impl Session {
 
         Self {
             config: Arc::new(config),
-            state: Arc::new(ArcSwap::from_pointee(SessionState::new(ActiveTracks {
-                audio: None,
-                video: None,
-                subs: None,
-            }))),
+            state: Arc::new(ArcSwap::from_pointee(SessionState::new())),
             clock: Arc::new(Clock::default()),
             external_callback,
             event_tx: None,
@@ -134,6 +130,7 @@ impl Session {
     pub fn open(&mut self, path: String) -> Result<(), SessionError> {
         let (event_tx, event_rx) = channel::Builder::unbounded().channel();
         self.event_tx = Some(event_tx.clone());
+        self.state.store(Arc::new(SessionState::new()));
         let session_state = self.state.clone();
 
         let shared = SharedPlayerState {
@@ -165,6 +162,7 @@ impl Session {
                     }
                     Err(e) => {
                         error!("Failed to open a playback session for '{}': {:?}", path, e);
+                        session_state.store(Arc::new(SessionState::new()));
                         external_callback(ExternalEvent::Error(e));
                     }
                 }
@@ -183,6 +181,10 @@ impl Session {
 
     pub fn active_tracks(&self) -> ActiveTracks {
         self.state.load().tracks
+    }
+
+    pub fn playback_mode(&self) -> PlaybackMode {
+        self.state.load().mode
     }
 
     pub fn play(&mut self) {
@@ -220,12 +222,15 @@ impl Session {
         }
     }
 
-    pub fn seek_to(&mut self, pos_ms: i64) {
+    pub fn seek_to(&mut self, pos_ms: i64) -> bool {
         let state = self.state.load();
 
-        if !matches!(state.operation, PlaybackOperation::Seeking(_)) {
-            self.apply_event(ControlEvent::Seek(pos_ms));
+        if matches!(state.operation, PlaybackOperation::Seeking(_)) {
+            return false;
         }
+
+        self.apply_event(ControlEvent::Seek(pos_ms));
+        true
     }
 
     pub fn seek_rel(&mut self, offset_ms: i64) {

@@ -2,41 +2,47 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{
-    collections::HashMap,
-    fmt::Write,
-    time::{Duration, Instant},
-};
+use std::path::PathBuf;
 
 use clap::Parser;
-use gilia::{
-    Player,
-    engine::{
-        ExternalEvent::{self, Opened, TrackChanged, VolumesChanged},
-        PlayerMeta, SessionConfig, TrackKind,
-    },
-};
+use gilia::engine::SessionConfig;
 use iced::{
-    Background, Color, Element, Length, Task, Theme,
-    futures::{self, SinkExt},
-    keyboard::{
-        self,
-        Key::{self, Character, Named},
-        Modifiers,
-        key::Named::{ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Space},
-    },
-    mouse::ScrollDelta,
-    widget::{container, mouse_area, stack, text},
-    window::{self, Settings},
+    Length, Task, Theme, Widget,
+    widget::{container, mouse_area, text},
+    window::{self, Settings, raw_window_handle::RawDisplayHandle},
 };
 use time::{UtcOffset, macros::format_description};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt::time::OffsetTime};
 
+mod playback;
+mod widgets;
+
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
-    path: String,
+    path: Option<String>,
+}
+
+struct App {
+    window: window::Id,
+    playback: playback::Playback,
+    fullscreen: bool,
+    drop_supported: bool,
+    picking: bool,
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    Playback(playback::Message),
+    DropSupportKnown(bool),
+    OpenFile,
+    FilePicked(Option<PathBuf>),
+    FileDropped(window::Id, PathBuf),
+    ToggleFullscreen,
+    GotMode(window::Mode),
+    WindowClosed(window::Id),
+    Exit,
 }
 
 fn main() -> iced::Result {
@@ -68,335 +74,133 @@ fn main() -> iced::Result {
         .run()
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    WindowClosed(window::Id),
-    VideoHovered(bool),
-    KeyPressed(Key, keyboard::Modifiers),
-    Scroll(ScrollDelta),
-    CallbackEvent(ExternalEvent),
-    ClearText(u32),
-    GotMode(window::Mode),
-}
-
-enum WindowKind {
-    Main,
-}
-
-struct App {
-    windows: HashMap<window::Id, WindowKind>,
-    player: Player,
-    metadata: Option<PlayerMeta>,
-    video_hovered: bool,
-    first_volume_change: bool,
-    text_id: u32,
-    text: Option<String>,
-    last_seek_time: Instant,
-    eof_loop: bool,
+fn supports_file_drop(window: &dyn window::Window) -> bool {
+    window
+        .display_handle()
+        .is_ok_and(|handle| !matches!(handle.as_raw(), RawDisplayHandle::Wayland(_)))
 }
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
-        let path = Args::parse().path;
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let cb = move |event| {
-            event_tx.send(event).ok();
-        };
-        let player = Player::new(path, SessionConfig { hw_dec: true }, cb);
-        let event_task = Task::stream(iced::stream::channel(
-            100,
-            move |mut sender: futures::channel::mpsc::Sender<Message>| async move {
-                while let Some(event) = event_rx.recv().await {
-                    sender.send(Message::CallbackEvent(event)).await.ok();
-                }
-            },
-        ));
+        let (mut playback, playback_task) = playback::Playback::new(SessionConfig { hw_dec: true });
+        if let Some(path) = Args::parse().path {
+            playback.open(path);
+        }
         let (id, open) = window::open(Settings::default());
-        let open = open.discard();
-        let mut windows = HashMap::new();
-        windows.insert(id, WindowKind::Main);
+        let open = open.then(|id| {
+            Task::batch([
+                window::gain_focus(id),
+                window::run(id, supports_file_drop).map(Message::DropSupportKnown),
+            ])
+        });
+
         (
             Self {
-                windows,
-                player,
-                metadata: None,
-                video_hovered: false,
-                first_volume_change: true,
-                text_id: 0,
-                text: None,
-                last_seek_time: Instant::now(),
-                eof_loop: false,
+                window: id,
+                playback,
+                fullscreen: false,
+                drop_supported: false,
+                picking: false,
             },
-            Task::batch([open, event_task]),
+            Task::batch([open, playback_task]),
         )
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
         iced::Subscription::batch([
             window::close_events().map(Message::WindowClosed),
-            keyboard::listen().filter_map(|e| {
-                if let keyboard::Event::KeyPressed { key, modifiers, .. } = e {
-                    Some(Message::KeyPressed(key, modifiers))
-                } else {
-                    None
-                }
+            window::events().filter_map(|(id, event)| match event {
+                window::Event::FileDropped(path) => Some(Message::FileDropped(id, path)),
+                _ => None,
             }),
+            self.playback.subscription(),
         ])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Playback(message) => self.playback.update(message),
+            Message::DropSupportKnown(supported) => {
+                self.drop_supported = supported;
+                Task::none()
+            }
+            Message::OpenFile if self.playback.unopened() && !self.picking => {
+                self.picking = true;
+                Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_file()
+                            .await
+                            .map(|file| file.path().to_path_buf())
+                    },
+                    Message::FilePicked,
+                )
+            }
+            Message::FilePicked(path) if self.picking => {
+                self.picking = false;
+                if let Some(path) = path {
+                    self.playback.open(path.to_string_lossy().to_string());
+                }
+                Task::none()
+            }
+            Message::FileDropped(id, path)
+                if id == self.window && self.playback.unopened() && !self.picking =>
+            {
+                self.playback.open(path.to_string_lossy().to_string());
+                Task::none()
+            }
+            Message::OpenFile | Message::FilePicked(_) | Message::FileDropped(..) => Task::none(),
+            Message::ToggleFullscreen => window::mode(self.window).map(Message::GotMode),
+            Message::GotMode(mode) => match mode {
+                window::Mode::Windowed => {
+                    self.fullscreen = true;
+                    window::set_mode(self.window, window::Mode::Fullscreen)
+                }
+                window::Mode::Fullscreen => {
+                    self.fullscreen = false;
+                    window::set_mode(self.window, window::Mode::Windowed)
+                }
+                window::Mode::Hidden => Task::none(),
+            },
             Message::WindowClosed(id) => {
-                if Some(id) == self.main_id() {
-                    iced::exit()
+                if id == self.window {
+                    Task::done(Message::Exit)
                 } else {
                     Task::none()
                 }
             }
-            Message::VideoHovered(bool) => {
-                self.video_hovered = bool;
-                Task::none()
-            }
-            Message::KeyPressed(key, modifiers) => self.key_pressed(key, modifiers),
-            Message::Scroll(delta) => match delta {
-                ScrollDelta::Lines { x: _, y } => {
-                    if y > 0.0 {
-                        return self.adjust_volume(0.02);
-                    } else if y < 0.0 {
-                        return self.adjust_volume(-0.02);
-                    }
-                    Task::none()
-                }
-                ScrollDelta::Pixels { x: _, y: _ } => Task::none(),
-            },
-            Message::CallbackEvent(event) => self.callback_event(event),
-            Message::ClearText(id) => {
-                if self.text_id == id {
-                    self.text = None;
-                }
-                Task::none()
-            }
-            Message::GotMode(mode) => {
-                let Some(main_id) = self.main_id() else {
-                    return Task::none();
-                };
-                match mode {
-                    window::Mode::Windowed => window::set_mode(main_id, window::Mode::Fullscreen),
-                    window::Mode::Fullscreen => window::set_mode(main_id, window::Mode::Windowed),
-                    window::Mode::Hidden => Task::none(),
-                }
-            }
+            Message::Exit => iced::exit(),
         }
     }
 
-    fn set_text(&mut self, text: String, duration: Duration) -> Task<Message> {
-        let text_id = self.text_id + 1;
-        self.text_id = text_id;
-        self.text = Some(text);
-        Task::perform(tokio::time::sleep(duration), move |()| {
-            Message::ClearText(text_id)
-        })
-    }
-
-    fn callback_event(&mut self, event: ExternalEvent) -> Task<Message> {
-        match event {
-            Opened(meta) => {
-                self.metadata = Some(meta);
-                Task::none()
-            }
-            TrackChanged(kind, id) => {
-                let Some(meta) = self.metadata.as_ref() else {
-                    return Task::none();
-                };
-
-                let Some(track_meta) = meta.get_track(id) else {
-                    return Task::none();
-                };
-
-                let label = match kind {
-                    TrackKind::Audio => "Audio",
-                    TrackKind::Video => "Video",
-                    TrackKind::Subtitle => "Subtitles",
-                };
-
-                let mut text = format!("{label}: ({id})");
-
-                if let Some(title) = &track_meta.title {
-                    let _ = write!(text, "\"{title}\"");
-                }
-
-                if let Some(lang) = &track_meta.lang {
-                    let _ = write!(text, " ({lang})");
-                }
-
-                self.set_text(text, Duration::from_secs(2))
-            }
-            VolumesChanged(volumes) => {
-                if self.first_volume_change {
-                    self.first_volume_change = false;
-                    return Task::none();
-                }
-                let channel1_vol = volumes.first().copied().unwrap_or(0.0);
-                let text = format!("Volume {}%", (channel1_vol * 100.0).round() as u32);
-                self.set_text(text, Duration::from_secs(2))
-            }
-            ExternalEvent::Eof => {
-                if self.eof_loop {
-                    self.player.seek_to(0);
-                    self.player.play();
-                }
-                Task::none()
-            }
-            ExternalEvent::NewFrame | ExternalEvent::Error(_) => Task::none(),
+    fn view(&self, _window: window::Id) -> impl Widget<Message> {
+        if !self.playback.unopened() {
+            return self.playback.view(self.fullscreen).boxed();
         }
-    }
 
-    fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
-        if self.video_hovered {
-            match key.as_ref() {
-                Named(Space) | Character("k") => {
-                    self.player.toggle_playback();
-                    Task::none()
-                }
-                Named(ArrowUp) => self.adjust_volume(0.02),
-                Named(ArrowDown) => self.adjust_volume(-0.02),
-                Named(ArrowLeft) => {
-                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
-                        self.last_seek_time = Instant::now();
-                        self.player.seek_rel(-5000);
-                    }
-                    Task::none()
-                }
-                Named(ArrowRight) => {
-                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
-                        self.last_seek_time = Instant::now();
-                        self.player.seek_rel(5000);
-                    }
-                    Task::none()
-                }
-                Character("f") => {
-                    let Some(main_id) = self.main_id() else {
-                        return Task::none();
-                    };
-                    window::mode(main_id).map(Message::GotMode)
-                }
-                Character("j") => {
-                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
-                        self.last_seek_time = Instant::now();
-                        self.player.seek_rel(-10000);
-                    }
-                    Task::none()
-                }
-                Character("l") => {
-                    if self.last_seek_time.elapsed() > Duration::from_millis(100) {
-                        self.last_seek_time = Instant::now();
-                        self.player.seek_rel(10000);
-                    }
-                    Task::none()
-                }
-                Character("r") => {
-                    if modifiers.shift() {
-                        self.eof_loop = !self.eof_loop;
-                        self.set_text(format!("Loop: {}", self.eof_loop), Duration::from_secs(2))
-                    } else {
-                        // TODO handle ab looping
-                        Task::none()
-                    }
-                }
-                Character("t") => {
-                    let total_second = self.player.position_ms() / 1000;
-                    let second = total_second % 60;
-                    let minute = (total_second / 60) % 60;
-                    let hour = total_second / 3600;
-                    let text = format!("{hour:02}:{minute:02}:{second:02}");
-                    self.set_text(text, Duration::from_secs(2))
-                }
-                Character("a") => {
-                    if let Some(meta) = &self.metadata {
-                        let active_tracks = self.player.active_tracks();
-                        if let Some(next_audio) =
-                            meta.next_track(TrackKind::Audio, active_tracks.audio)
-                        {
-                            self.player.select_track(TrackKind::Audio, next_audio.id);
-                        }
-                    }
-                    Task::none()
-                }
-                Character("s") => {
-                    if let Some(meta) = &self.metadata {
-                        let active_tracks = self.player.active_tracks();
-                        if let Some(next_sub) =
-                            meta.next_track(TrackKind::Subtitle, active_tracks.subs)
-                        {
-                            self.player.select_track(TrackKind::Subtitle, next_sub.id);
-                        }
-                    }
-                    Task::none()
-                }
-                Character("v") => {
-                    if let Some(meta) = &self.metadata {
-                        let active_tracks = self.player.active_tracks();
-                        if let Some(next_video) =
-                            meta.next_track(TrackKind::Video, active_tracks.video)
-                        {
-                            self.player.select_track(TrackKind::Video, next_video.id);
-                        }
-                    }
-                    Task::none()
-                }
-                _ => Task::none(),
-            }
+        let label = if self.picking {
+            "Choosing a file…"
+        } else if self.drop_supported {
+            "Drag a file here or click to open"
         } else {
-            Task::none()
-        }
-    }
-
-    fn adjust_volume(&mut self, change: f32) -> Task<Message> {
-        let max_volume = if cfg!(target_os = "windows") {
-            1.0
-        } else {
-            1.5
+            "Click to open a file"
         };
-        let channel1_vol = self
-            .player
-            .modify_volumes(|v| (v + change).clamp(0.0, max_volume));
-        let text = format!("Volume {}%", (channel1_vol * 100.0).round() as u32);
-        self.set_text(text, Duration::from_secs(2))
-    }
 
-    fn view(&self, window: window::Id) -> Element<'_, Message> {
-        if Some(window) == self.main_id() {
-            let player = container(self.player.view()).style(|_| container::Style {
-                background: Some(Background::Color(Color::BLACK)),
+        let area = container(text(label))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(iced::Color::BLACK)),
                 ..Default::default()
             });
-            let player_area = mouse_area(player)
-                .on_enter(Message::VideoHovered(true))
-                .on_exit(Message::VideoHovered(false))
-                .on_scroll(Message::Scroll)
-                .on_press(Message::KeyPressed(
-                    Key::Named(iced::keyboard::key::Named::Space),
-                    Modifiers::NONE,
-                )); // Not ideal but I don't want to create another message when keypressed space is fine
 
-            if let Some(top_text) = &self.text {
-                let message = container(text(top_text).size(25))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .padding(10);
-                stack![player_area, message].into()
-            } else {
-                stack![player_area].into()
-            }
+        if self.picking {
+            area.boxed()
         } else {
-            iced::widget::space().into()
+            mouse_area(area)
+                .on_press(Message::OpenFile)
+                .interaction(iced::mouse::Interaction::Pointer)
+                .boxed()
         }
-    }
-
-    fn main_id(&self) -> Option<window::Id> {
-        self.windows
-            .iter()
-            .find(|(_, kind)| matches!(kind, WindowKind::Main))
-            .map(|(id, _)| *id)
     }
 }

@@ -83,14 +83,26 @@ pub enum Worker {
 }
 
 impl SessionState {
-    pub fn new(tracks: ActiveTracks) -> Self {
+    pub fn new() -> Self {
         Self {
             mode: PlaybackMode::Playing,
             operation: PlaybackOperation::None,
             phase: PlaybackPhase::Active,
-            tracks,
+            tracks: ActiveTracks {
+                audio: None,
+                video: None,
+                subs: None,
+            },
         }
     }
+
+    pub fn opened(tracks: ActiveTracks) -> Self {
+        Self {
+            tracks,
+            ..Self::new()
+        }
+    }
+
     pub fn is_busy(&self) -> bool {
         self.operation != PlaybackOperation::None
     }

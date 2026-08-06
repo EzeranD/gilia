@@ -51,6 +51,7 @@
           fileset = lib.fileset.unions [
             (craneLib.fileset.commonCargoSources unfilteredRoot)
             ./shaders
+            ./assets
           ];
         };
 

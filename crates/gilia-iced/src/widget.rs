@@ -4,8 +4,11 @@
 
 use gilia_engine::Session;
 use iced::{
-    Element, Event, Length, Rectangle, Size,
-    advanced::{Layout, Shell, Widget, layout, mouse, renderer, widget::Tree},
+    Event, Length, Rectangle, Size,
+    advanced::{
+        Layout, Shell, layout, mouse, renderer,
+        widget::{Meta, Tree},
+    },
 };
 
 use crate::{subs::SubPrimitive, video::VideoPrimitive};
@@ -38,16 +41,9 @@ impl<'a> PlayerWidget<'a> {
     }
 }
 
-impl<'a, Message, Theme, Renderer> From<PlayerWidget<'a>> for Element<'a, Message, Theme, Renderer>
-where
-    Renderer: iced_wgpu::primitive::Renderer,
-{
-    fn from(widget: PlayerWidget<'a>) -> Self {
-        Element::new(widget)
-    }
-}
+impl Meta for PlayerWidget<'_> {}
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for PlayerWidget<'_>
+impl<Message, Theme, Renderer> iced::advanced::Widget<Message, Theme, Renderer> for PlayerWidget<'_>
 where
     Renderer: iced_wgpu::primitive::Renderer,
 {
@@ -58,20 +54,15 @@ where
         }
     }
 
-    fn layout(
-        &mut self,
-        _tree: &mut Tree,
-        _renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        layout::atomic(limits, self.width, self.height)
+    fn layout(&mut self, tree: &mut Tree, _renderer: &Renderer, limits: &layout::Limits) {
+        tree.size = layout::atomic(limits, self.width, self.height);
     }
 
     fn update(
         &mut self,
         _tree: &mut Tree,
         _event: &Event,
-        _layout: Layout<'_>,
+        _layout: Layout,
         _cursor: mouse::Cursor,
         _renderer: &Renderer,
         _shell: &mut Shell<'_, Message>,
@@ -85,7 +76,7 @@ where
         renderer: &mut Renderer,
         _theme: &Theme,
         _style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
@@ -97,8 +88,10 @@ where
                 layout.bounds(),
                 VideoPrimitive::new(frame, self.session.video_output.current_pts.clone()),
             );
-            let phys_width = layout.bounds().width * renderer.scale_factor().unwrap_or(1.0);
-            let phys_height = layout.bounds().height * renderer.scale_factor().unwrap_or(1.0);
+            let phys_width =
+                layout.bounds().width * renderer.scale().map_or(1.0, renderer::Scale::total);
+            let phys_height =
+                layout.bounds().height * renderer.scale().map_or(1.0, renderer::Scale::total);
             self.session.update_viewport(
                 phys_width,
                 phys_height,

@@ -6,4 +6,4 @@ pub use gilia_engine as engine;
 
 mod player;
 
-pub use player::Player;
+pub use player::{ChapterSeek, Player, SeekMode, seek::Seek};

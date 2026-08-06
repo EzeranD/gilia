@@ -12,6 +12,7 @@ pub enum ExternalEvent {
     Opened(PlayerMeta),
     NewFrame,
     TrackChanged(TrackKind, TrackId),
+    SeekCompleted(i64),
     VolumesChanged(Vec<f32>),
     Eof,
     Error(SessionError),

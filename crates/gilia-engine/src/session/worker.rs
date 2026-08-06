@@ -53,7 +53,7 @@ impl SessionWorker {
     ) -> Result<Self, SessionError> {
         let (streams, channels, threads, meta) = open(path, &shared, external_callback, &event_tx)?;
         let session = Self {
-            state: SessionState::new(streams),
+            state: SessionState::opened(streams),
             shared,
             channels,
             op_queue: VecDeque::new(),
@@ -213,6 +213,7 @@ impl SessionWorker {
                 self.channels.vo(VoEffect::Present);
             }
         }
+        (self.channels.external_callback)(ExternalEvent::SeekCompleted(pts));
     }
 
     fn switch_track(
