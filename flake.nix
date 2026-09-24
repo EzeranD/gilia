@@ -53,7 +53,7 @@
 
         commonArgs = {
           inherit src;
-          pname = "lmv";
+          pname = "gilia";
           version = (lib.importTOML ./Cargo.toml).workspace.package.version;
           cargoExtraArgs = "--features bin";
           strictDeps = true;
@@ -98,7 +98,7 @@
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        lmviewer = craneLib.buildPackage (
+        gilia = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
@@ -107,7 +107,7 @@
       in
       {
         checks = {
-          inherit lmviewer;
+          inherit gilia;
 
           clippy = craneLib.cargoClippy (
             commonArgs
@@ -157,11 +157,11 @@
         };
 
         packages = {
-          default = lmviewer;
+          default = gilia;
         };
 
         apps.default = flake-utils.lib.mkApp {
-          drv = lmviewer;
+          drv = gilia;
         };
 
         formatter = pkgs.alejandra;

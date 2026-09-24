@@ -930,6 +930,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "gilia"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ffmpeg-next",
+ "gilia-engine",
+ "gilia-iced",
+ "iced",
+ "pipewire",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gilia-engine"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "ash",
+ "bytemuck",
+ "crossbeam-channel",
+ "crossbeam-utils",
+ "ffmpeg-next",
+ "libass",
+ "libspa-sys",
+ "pipewire",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "gilia-iced"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "ffmpeg-next",
+ "gilia-engine",
+ "iced",
+ "iced_wgpu",
+ "libass",
+]
+
+[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1474,62 +1520,6 @@ name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
-
-[[package]]
-name = "lmv"
-version = "0.1.0"
-dependencies = [
- "ffmpeg-next",
- "lmv-engine",
- "lmv-iced",
- "pipewire",
- "tracing",
-]
-
-[[package]]
-name = "lmv-engine"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "ash",
- "bytemuck",
- "crossbeam-channel",
- "crossbeam-utils",
- "ffmpeg-next",
- "libass",
- "libspa-sys",
- "pipewire",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "lmv-iced"
-version = "0.1.0"
-dependencies = [
- "ash",
- "bytemuck",
- "ffmpeg-next",
- "iced",
- "iced_wgpu",
- "libass",
- "lmv-engine",
-]
-
-[[package]]
-name = "lmviewer"
-version = "0.1.0"
-dependencies = [
- "clap",
- "ffmpeg-next",
- "iced",
- "lmv",
- "pipewire",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "lock_api"

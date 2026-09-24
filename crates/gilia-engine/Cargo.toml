@@ -1,0 +1,20 @@
+[package]
+name = "gilia-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap = "1.9.1"
+ash.workspace = true
+bytemuck.workspace = true
+crossbeam-channel = "0.5.15"
+crossbeam-utils = "0.8.22"
+ffmpeg-next.workspace = true
+libass.workspace = true
+libspa-sys = "0.9.2"
+pipewire.workspace = true
+thiserror = "2.0.18"
+tracing.workspace = true

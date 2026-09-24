@@ -5,8 +5,8 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/EzeranD/lmviewer"
+license = "MPL-2.0"
+repository = "https://github.com/EzeranD/gilia"
 authors = ["Ezeran Duchesne"]
 
 [workspace.dependencies]
@@ -21,10 +21,10 @@ iced = { version = "0.15.0-dev", default-features = false, features = [
   "wayland",
   "advanced",
   "web-colors",
-  "fira-sans"
+  "fira-sans",
 ] }
 libass = { git = "https://github.com/EzeranD/libass-rs" }
-lmv-engine = { version = "0.1.0", path = "crates/lmv-engine" }
+gilia-engine = { version = "0.1.0", path = "crates/gilia-engine" }
 
 [patch.crates-io]
 iced = { git = "https://github.com/EzeranD/iced", branch = "master" }
