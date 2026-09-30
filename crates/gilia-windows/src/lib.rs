@@ -8,10 +8,10 @@ pub mod audio;
 pub mod com;
 pub mod sync;
 
-pub use audio::{OutputBuffer, OutputTiming, WasapiError, WasapiEvent, WasapiStream};
-pub use com::{Com, MmcssRegistration};
-pub use sync::{
-    EventReceiver, EventRecvTimeoutError, EventSendError, EventSender, SyncError, WakeEvent,
-    event_channel, timed_channel,
+pub use audio::{
+    ControlReceiver, OutputBuffer, OutputTiming, WasapiError, WasapiEvent, WasapiStream,
 };
+pub use com::{Com, MmcssRegistration};
+pub use sync::{SyncError, WaitableTimer, WakeEvent};
+pub use windows::Win32::Foundation::HANDLE;
 pub use windows_core::w;

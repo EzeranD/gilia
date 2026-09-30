@@ -10,17 +10,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(not(target_os = "windows"))]
-use crossbeam_channel::RecvTimeoutError;
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
 #[cfg(target_os = "windows")]
-use gilia_windows::{EventRecvTimeoutError as RecvTimeoutError, MmcssRegistration, w};
+use gilia_windows::{MmcssRegistration, w};
 use tracing::debug;
 
 use crate::{
     ExternalEvent,
     PlayerEvent::{self, Internal},
     VideoFrame,
+    channel::{Receiver, RecvTimeoutError, Sender, TryRecvError},
     engine::{ExternalCallback, get_engine_start},
     session::{InternalEvent::Drained, VoEffect, Worker},
     utils::Clock,
@@ -94,9 +92,9 @@ impl VideoOutput {
                                     continue;
                                 }
                                 Err(RecvTimeoutError::Timeout) => {}
-                                Err(RecvTimeoutError::Disconnected) => return,
-                                #[cfg(target_os = "windows")]
-                                Err(RecvTimeoutError::Sync { source }) => return,
+                                Err(
+                                    RecvTimeoutError::Disconnected | RecvTimeoutError::Wait { .. },
+                                ) => return,
                             }
                         }
                         if let Some(frame) = self.next_frame.take() {
@@ -111,9 +109,9 @@ impl VideoOutput {
                         match self.effect_rx.recv_timeout(Duration::from_millis(1)) {
                             Ok(effect) => self.effect_recv(effect),
                             Err(RecvTimeoutError::Timeout) => {}
-                            Err(RecvTimeoutError::Disconnected) => return,
-                            #[cfg(target_os = "windows")]
-                            Err(RecvTimeoutError::Sync { source }) => return,
+                            Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Wait { .. }) => {
+                                return;
+                            }
                         }
                     }
                     StageResult::Drained | StageResult::Disconnected => {

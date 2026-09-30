@@ -12,14 +12,14 @@ use super::{
     client::{AudioClient, ClientError, OutputBuffer},
     device::DeviceManager,
 };
-use crate::sync::{EventReceiver, SyncError, WaitResult, WakeEvent, wait_for_multiple};
+use crate::sync::{SyncError, WaitResult, WakeEvent, wait_for_multiple};
 
 #[derive(Debug, Snafu)]
 pub enum WasapiError {
+    #[snafu(display("channel is disconnected"))]
+    Disconnected,
     #[snafu(display("failed to create WASAPI stream events"))]
     CreateEvents { source: SyncError },
-    #[snafu(display("control channel disconnected"))]
-    Disconnected,
     #[snafu(display("failed while waiting for WASAPI events"))]
     WaitEvents { source: SyncError },
     #[snafu(display("failed to check whether the WASAPI stream is empty"))]
@@ -38,19 +38,26 @@ pub struct WasapiStream {
     active: bool,
 }
 
-struct StreamEvents {
-    device: WakeEvent,
-    audio: WakeEvent,
-    volume: WakeEvent,
-    disconnect: WakeEvent,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum WasapiEvent<T> {
     Audio,
     Control(T),
     Volume(f32),
     Connected(bool),
+}
+
+pub trait ControlReceiver {
+    type Message;
+
+    fn try_recv(&self) -> Result<Option<Self::Message>, WasapiError>;
+    fn raw(&self) -> HANDLE;
+}
+
+struct StreamEvents {
+    device: WakeEvent,
+    audio: WakeEvent,
+    volume: WakeEvent,
+    disconnect: WakeEvent,
 }
 
 impl WasapiStream {
@@ -127,20 +134,19 @@ impl WasapiStream {
         true
     }
 
-    pub fn wait<T>(&mut self, control: &EventReceiver<T>) -> Result<WasapiEvent<T>, WasapiError> {
+    pub fn wait<C: ControlReceiver>(
+        &mut self,
+        control: &C,
+    ) -> Result<WasapiEvent<C::Message>, WasapiError> {
         loop {
-            match control.try_recv() {
-                Ok(msg) => return Ok(WasapiEvent::Control(msg)),
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    return Err(WasapiError::Disconnected);
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            if let Some(message) = control.try_recv()? {
+                return Ok(WasapiEvent::Control(message));
             }
 
             let (handles, timeout, count) = match &self.connection {
                 Some(_) => (
                     [
-                        control.event().raw(),
+                        control.raw(),
                         self.events.device.raw(),
                         self.events.audio.raw(),
                         self.events.volume.raw(),
@@ -151,7 +157,7 @@ impl WasapiStream {
                 ),
                 None => (
                     [
-                        control.event().raw(),
+                        control.raw(),
                         self.events.device.raw(),
                         HANDLE::default(),
                         HANDLE::default(),
@@ -162,14 +168,14 @@ impl WasapiStream {
                 ),
             };
 
-            match wait_for_multiple(&handles[..count], timeout).context(WaitEventsSnafu)? {
-                WaitResult::Object(0) => match control.try_recv() {
-                    Ok(msg) => return Ok(WasapiEvent::Control(msg)),
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        return Err(WasapiError::Disconnected);
+            let result = wait_for_multiple(&handles[..count], timeout).context(WaitEventsSnafu)?;
+
+            match result {
+                WaitResult::Object(0) => {
+                    if let Some(message) = control.try_recv()? {
+                        return Ok(WasapiEvent::Control(message));
                     }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {}
-                },
+                }
                 WaitResult::Object(2) => return Ok(WasapiEvent::Audio),
                 WaitResult::Object(3) => return Ok(WasapiEvent::Volume(self.get_volume())),
                 WaitResult::Object(1 | 4) | WaitResult::Timeout => {

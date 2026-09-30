@@ -9,11 +9,11 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::Sender;
 use tracing::error;
 
 use crate::{
     TrackKind,
+    channel::{self, Sender},
     session::{ActiveTracks, PlayerEvent, PlayerMeta, PlayerSession, SessionState, TrackId},
     subtitle::decoder::SubtitleFrame,
     utils::Clock,
@@ -122,7 +122,7 @@ impl PlayerEngine {
     }
 
     pub fn open(&mut self, path: String) -> Result<(), EngineError> {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = channel::Builder::unbounded().channel();
         self.event_tx = Some(event_tx.clone());
         let session_state = self.state.clone();
 

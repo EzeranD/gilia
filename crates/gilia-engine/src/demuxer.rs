@@ -2,16 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::sync::Arc;
 
-use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next::{Packet, Rescale, format::context::Input, media::Type};
 
 use crate::{
     PlayerEvent::{self, Internal},
     TrackKind,
+    channel::{Receiver, Sender, select_biased},
     session::{DemuxerEffect, InternalEvent::DemuxerEof},
-    utils::{Clock, MemoryBudget, ThreadWaker, TrackedPacket},
+    utils::{Clock, MemoryBudget, TrackedPacket},
 };
 
 pub struct Demuxer {
@@ -22,7 +22,6 @@ pub struct Demuxer {
     effect_rx: Receiver<DemuxerEffect>,
     event_tx: Sender<PlayerEvent>,
     clock: Arc<Clock>,
-    pub waker: Arc<ThreadWaker>,
     budget: MemoryBudget,
 }
 
@@ -46,7 +45,6 @@ impl Demuxer {
         effect_rx: Receiver<DemuxerEffect>,
         event_tx: Sender<PlayerEvent>,
         clock: Arc<Clock>,
-        waker: Arc<ThreadWaker>,
         budget: MemoryBudget,
     ) -> Self {
         let video_stream = StreamInfo {
@@ -78,7 +76,6 @@ impl Demuxer {
             effect_rx,
             event_tx,
             clock,
-            waker,
             budget,
         }
     }
@@ -87,13 +84,12 @@ impl Demuxer {
         loop {
             let mut received_effect = None;
             loop {
-                if let Ok(effect) = self.effect_rx.try_recv() {
-                    received_effect = Some(effect);
-                    break;
-                }
-                if self.budget.over_limit() {
-                    thread::park_timeout(Duration::from_millis(10));
-                    continue;
+                select_biased! {
+                    recv(self.effect_rx) -> effect => {
+                        received_effect = effect.ok();
+                        break;
+                    }
+                    ready(self.budget) => {}
                 }
                 let mut packet = Packet::empty();
                 match packet.read(&mut self.ictx) {
@@ -123,8 +119,7 @@ impl Demuxer {
                         }
 
                         let tracked_packet = TrackedPacket::new(packet, self.budget.clone());
-
-                        crossbeam_channel::select_biased! {
+                        select_biased! {
                             recv(self.effect_rx) -> effect => {
                                 received_effect = effect.ok();
                                 break;

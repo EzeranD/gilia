@@ -2,19 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::atomic::Ordering;
 
-use crossbeam_channel::Sender;
 use ffmpeg_next::{format::input, media::Type};
 
 use super::messages::{AudioChannels, SessionChannels, SubtitleChannels, VideoChannels};
 use crate::{
     ActiveTracks, PlayerEvent, PlayerMeta, PlayerThreads, SharedPlayerState,
     audio::spawn_audio_stream,
+    channel::{self, Sender},
     demuxer::Demuxer,
     engine::{EngineError, ExternalCallback},
     subtitle::spawn_sub_stream,
-    utils::{MemoryBudget, ThreadWaker},
+    utils::MemoryBudget,
     video::spawn_video_stream,
 };
 
@@ -25,7 +25,7 @@ pub fn open(
     event_tx: &Sender<PlayerEvent>,
 ) -> Result<(ActiveTracks, SessionChannels, PlayerThreads, PlayerMeta), EngineError> {
     let ictx = input(&path)?;
-    let (demuxer_tx, demuxer_rx) = crossbeam_channel::unbounded();
+    let (demuxer_tx, demuxer_rx) = channel::Builder::unbounded().channel();
     let mut channels = SessionChannels::new(demuxer_tx, external_callback.clone());
     let mut threads = PlayerThreads::default();
 
@@ -99,8 +99,7 @@ pub fn open(
     }
 
     let demuxer_event_tx = event_tx.clone();
-    let demuxer_waker = Arc::new(ThreadWaker::new());
-    let memory_budget = MemoryBudget::new(150 * 1024 * 1024, demuxer_waker.clone());
+    let memory_budget = MemoryBudget::new(150 * 1024 * 1024);
     let mut demuxer = Demuxer::new(
         ictx,
         video_idx,
@@ -112,13 +111,11 @@ pub fn open(
         demuxer_rx,
         demuxer_event_tx,
         shared.clock.clone(),
-        demuxer_waker,
         memory_budget,
     );
     let demuxer_handle = std::thread::Builder::new()
         .name("demuxer".into())
         .spawn(move || {
-            demuxer.waker.set();
             demuxer.read_packets();
         })
         .unwrap();

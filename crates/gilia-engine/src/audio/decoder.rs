@@ -2,9 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{mem, sync::Arc, thread};
+use std::{mem, sync::Arc};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use ffmpeg_next::{
     ChannelLayout, Packet, Rational, Rescale,
     codec::Context,
@@ -18,6 +17,7 @@ use tracing::{debug, error};
 use crate::{
     PlayerEvent::Internal,
     audio::queue::{AudioBlock, Producer, PushError},
+    channel::{Receiver, Sender, TryRecvError, select_biased},
     session::{
         DecoderEffect, InternalEvent::Drained, PlayerEvent, ReinitDetails, SyncMode, Worker,
     },
@@ -87,7 +87,7 @@ impl AudioDecoder {
         loop {
             match self.state {
                 DecoderState::Active => {
-                    crossbeam_channel::select_biased! {
+                    select_biased! {
                         recv(self.effect_rx) -> effect => {
                             self.effect_recv(effect.unwrap());
                         }
@@ -97,7 +97,7 @@ impl AudioDecoder {
                     }
                 }
                 DecoderState::Syncing(ref sync_tx, mode) => {
-                    crossbeam_channel::select_biased! {
+                    select_biased! {
                         recv(self.effect_rx) -> effect => {
                             self.effect_recv(effect.unwrap());
                         }
@@ -231,19 +231,23 @@ impl AudioDecoder {
 
     fn push_block(&mut self, mut block: AudioBlock) -> PushBlockResult {
         loop {
-            match self.effect_rx.try_recv() {
-                Ok(effect) => {
-                    self.effect_recv(effect);
-                    return PushBlockResult::Interrupted;
+            select_biased! {
+                recv(self.effect_rx) -> effect => {
+                    match effect {
+                        Ok(effect) => {
+                            self.effect_recv(effect);
+                            return PushBlockResult::Interrupted;
+                        }
+                        Err(_) => return PushBlockResult::Disconnected,
+                    }
                 }
-                Err(TryRecvError::Disconnected) => return PushBlockResult::Disconnected,
-                Err(TryRecvError::Empty) => {}
+                ready(self.audio_buffer) => {
+                    match self.audio_buffer.try_push(block) {
+                        Ok(()) => return PushBlockResult::Pushed,
+                        Err(PushError::Full { value }) => block = value,
+                    }
+                }
             }
-            match self.audio_buffer.try_push(block) {
-                Ok(()) => return PushBlockResult::Pushed,
-                Err(PushError::Full(ret)) => block = ret,
-            }
-            thread::park();
         }
     }
 

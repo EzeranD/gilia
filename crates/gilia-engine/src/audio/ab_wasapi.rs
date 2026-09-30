@@ -7,15 +7,13 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use crossbeam_channel::Sender;
-use gilia_windows::{
-    Com, EventReceiver, MmcssRegistration, WasapiError, WasapiEvent, WasapiStream, w,
-};
+use gilia_windows::{Com, MmcssRegistration, WasapiError, WasapiEvent, WasapiStream, w};
 use tracing::warn;
 
 use crate::{
     PlayerEvent::Internal,
     audio::queue::Consumer,
+    channel::{EventReceiver, Sender},
     engine::{ExternalCallback, ExternalEvent, get_engine_start},
     session::{AbEffect, InternalEvent::Drained, PlayerEvent, Worker},
     utils::Clock,

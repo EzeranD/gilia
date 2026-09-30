@@ -4,7 +4,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next::{
     Rational, Rescale,
     codec::{Context, Id},
@@ -14,6 +13,7 @@ use libass::{Change, Layer};
 use tracing::warn;
 
 use crate::{
+    channel::{Receiver, Sender, select_biased},
     session::{DecoderEffect, PlayerEvent, ReinitDetails, SyncMode, Worker},
     utils::{Clock, TrackedPacket},
 };
@@ -62,7 +62,7 @@ impl SubtitleDecoder {
     }
     pub fn process(&mut self) {
         loop {
-            let packet = crossbeam_channel::select_biased! {
+            let packet = select_biased! {
                 recv(self.effect_rx) -> effect => {
                     self.effect_recv(effect.unwrap());
                     continue

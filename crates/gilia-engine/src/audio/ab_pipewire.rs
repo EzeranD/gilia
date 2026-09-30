@@ -14,7 +14,6 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use crossbeam_channel::Sender;
 use libspa_sys::SPA_PROP_channelVolumes;
 use pipewire::{
     context::ContextRc,
@@ -34,6 +33,7 @@ use tracing::warn;
 use crate::{
     PlayerEvent::Internal,
     audio::queue::Consumer,
+    channel::{PipeReceiver, PipeWireError, Sender},
     engine::{ExternalCallback, ExternalEvent, get_engine_start},
     session::{AbEffect, InternalEvent::Drained, PlayerEvent, Worker},
     utils::Clock,
@@ -41,7 +41,7 @@ use crate::{
 
 pub fn spawn(
     mut audio_buffer: Consumer,
-    ab_effect_rx: pipewire::channel::Receiver<AbEffect>,
+    ab_effect_rx: PipeReceiver<AbEffect>,
     ab_event_tx: Sender<PlayerEvent>,
     rate: u32,
     audio_clock: Arc<Clock>,
@@ -80,8 +80,20 @@ pub fn spawn(
         let expected_rate = Rc::new(RefCell::new(Some(rate)));
         let recv_expected_rate = expected_rate.clone();
         let recv_event_tx = ab_event_tx.clone();
-        let _receiver = ab_effect_rx.attach(mainloop.loop_(), {
-            move |e| match e {
+        let mainloop_control = mainloop.clone();
+        let receiver = ab_effect_rx.attach(mainloop.loop_(), move |message| {
+            let effect = match message {
+                Ok(effect) => effect,
+                Err(e) => {
+                    if !matches!(e, PipeWireError::Disconnected) {
+                        warn!("Audio control receiver failed: {e}");
+                    }
+                    mainloop_control.quit();
+                    return;
+                }
+            };
+
+            match effect {
                 AbEffect::ModifyVolume(mut volumes) => {
                     for v in &mut volumes {
                         *v = (*v).clamp(0.0, 1.5).powi(3);
@@ -138,6 +150,7 @@ pub fn spawn(
                 }
             }
         });
+        let _receiver = receiver.unwrap();
 
         let _listener = stream
             .add_local_listener_with_user_data(())

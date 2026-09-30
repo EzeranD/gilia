@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 mod audio;
+mod channel;
 mod demuxer;
 mod engine;
 mod session;

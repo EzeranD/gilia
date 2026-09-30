@@ -7,7 +7,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased};
 use ffmpeg_next::{
     Packet, Rational, Rescale,
     codec::{Context, Parameters},
@@ -18,6 +17,7 @@ use tracing::{debug, error};
 pub use crate::video::frame::{DecoderMode, VideoFrame, wrap_frame};
 use crate::{
     PlayerEvent::Internal,
+    channel::{Receiver, Sender, TryRecvError, select_biased},
     engine::EngineConfig,
     session::{
         DecoderEffect, InternalEvent::Drained, PlayerEvent, ReinitDetails, SyncMode, Worker,
@@ -335,7 +335,7 @@ impl VideoContext {
 
         while let Some(frame) = self.receive_frame() {
             let pts = frame.pts().map(|ts| ts.rescale(self.time_base, (1, 1000)));
-            crossbeam_channel::select_biased! {
+            select_biased! {
                 recv(self.effect_rx) -> effect => {
                     let effect = effect.unwrap();
                     self.effect_recv(effect, state);
@@ -370,7 +370,7 @@ impl VideoContext {
                 continue;
             }
 
-            crossbeam_channel::select_biased! {
+            select_biased! {
                 recv(self.effect_rx) -> effect => {
                     let effect = effect.unwrap();
                     self.effect_recv(effect, state);

@@ -7,11 +7,11 @@ use std::{
     thread::JoinHandle,
 };
 
-use crossbeam_channel::Sender;
 use ffmpeg_next::Stream;
 
 use crate::{
     EngineConfig, PlayerEvent, VideoFrame,
+    channel::{self, Sender},
     engine::{EngineError, ExternalCallback},
     session::{DecoderEffect, VoEffect},
     utils::{Clock, TrackedPacket},
@@ -23,15 +23,8 @@ pub mod frame;
 mod hw_ffmpeg;
 pub mod output;
 
-#[cfg(not(target_os = "windows"))]
-pub type VideoOutputSender = crossbeam_channel::Sender<VoEffect>;
-#[cfg(not(target_os = "windows"))]
-pub type VideoOutputReceiver = crossbeam_channel::Receiver<VoEffect>;
-
-#[cfg(target_os = "windows")]
-pub type VideoOutputSender = gilia_windows::EventSender<VoEffect>;
-#[cfg(target_os = "windows")]
-pub type VideoOutputReceiver = gilia_windows::EventReceiver<VoEffect>;
+pub type VideoOutputSender = channel::Sender<VoEffect>;
+pub type VideoOutputReceiver = channel::Receiver<VoEffect>;
 
 pub fn spawn_video_stream(
     video_stream: &Stream,
@@ -51,19 +44,11 @@ pub fn spawn_video_stream(
     ),
     EngineError,
 > {
-    let (vo_tx, vp_rx) = {
-        #[cfg(target_os = "windows")]
-        {
-            // TODO replace this with proper error handling
-            gilia_windows::timed_channel().unwrap()
-        }
-        #[cfg(not(target_os = "windows"))]
-        crossbeam_channel::unbounded()
-    };
+    let (vo_tx, vp_rx) = channel::Builder::unbounded().channel();
 
-    let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
-    let (video_tx, video_rx) = crossbeam_channel::unbounded();
-    let (video_packet_tx, video_packet_rx) = crossbeam_channel::unbounded();
+    let (frame_tx, frame_rx) = channel::Builder::bounded(3).channel();
+    let (video_tx, video_rx) = channel::Builder::unbounded().channel();
+    let (video_packet_tx, video_packet_rx) = channel::Builder::unbounded().channel();
 
     let video_time_base = video_stream.time_base();
     let parameters = video_stream.parameters();

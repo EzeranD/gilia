@@ -12,8 +12,25 @@ use std::{
 };
 
 use crossbeam_utils::CachePadded;
+use snafu::Snafu;
+use tracing::warn;
 
-use crate::utils::ThreadWaker;
+use crate::channel::wait::{WaitSource, Waiter, WaiterKind, WaiterSlot};
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum PushError {
+    #[snafu(display("buffer full"))]
+    Full { value: AudioBlock },
+}
+
+pub struct Consumer {
+    inner: Arc<AudioQueue>,
+    pub stride: usize,
+    block_pos: Arc<AtomicUsize>,
+}
+
+pub struct Producer(Arc<AudioQueue>);
 
 #[derive(Debug)]
 pub struct AudioBlock {
@@ -22,35 +39,20 @@ pub struct AudioBlock {
     pub pts: i64,
 }
 
-pub struct Consumer {
-    inner: Arc<AudioQueue>,
-    waker: Arc<ThreadWaker>,
-    pub stride: usize,
-    block_pos: Arc<AtomicUsize>,
-}
-
-pub struct Producer(Arc<AudioQueue>);
-
-#[derive(Debug, thiserror::Error)]
-pub enum PushError {
-    #[error("buffer full")]
-    Full(AudioBlock),
-}
-
 struct AudioQueue {
     read: CachePadded<AtomicUsize>,
     write: CachePadded<AtomicUsize>,
     queue: Box<[UnsafeCell<MaybeUninit<AudioBlock>>]>,
     capacity: usize,
+    waiter: WaiterSlot,
 }
 
-pub fn queue(capacity: usize, waker: Arc<ThreadWaker>) -> (Producer, Consumer) {
+pub fn queue(capacity: usize) -> (Producer, Consumer) {
     let inner = Arc::new(AudioQueue::new(capacity));
     (
         Producer(inner.clone()),
         Consumer {
             inner,
-            waker,
             stride: 8,
             block_pos: Arc::new(AtomicUsize::new(0)),
         },
@@ -106,7 +108,9 @@ impl Consumer {
 
         if read != initial_read {
             self.inner.read.store(read, Ordering::Release);
-            self.waker.unpark();
+            if let Err(e) = self.inner.waiter.wake() {
+                warn!("Failed to wake audio producer: {e}");
+            }
         }
         self.block_pos.store(block_pos, Ordering::Relaxed);
         if filled == 0 {
@@ -139,7 +143,9 @@ impl Consumer {
         if drained > 0 {
             self.block_pos.store(0, Ordering::Relaxed);
             self.inner.read.store(read, Ordering::Release);
-            self.waker.unpark();
+            if let Err(e) = self.inner.waiter.wake() {
+                warn!("Failed to wake audio producer: {e}");
+            }
         }
 
         drained
@@ -162,6 +168,9 @@ impl Consumer {
 
         self.inner.read.store(write, Ordering::Release);
         self.block_pos.store(0, Ordering::Relaxed);
+        if let Err(e) = self.inner.waiter.wake() {
+            warn!("Failed to wake audio producer: {e}");
+        }
     }
 }
 
@@ -169,7 +178,6 @@ impl Clone for Consumer {
     fn clone(&self) -> Self {
         Consumer {
             inner: self.inner.clone(),
-            waker: self.waker.clone(),
             stride: self.stride,
             block_pos: self.block_pos.clone(),
         }
@@ -182,7 +190,7 @@ impl Producer {
         let read = self.0.read.load(Ordering::Acquire);
 
         if write.wrapping_sub(read) >= self.0.capacity {
-            Err(PushError::Full(block))
+            Err(PushError::Full { value: block })
         } else {
             unsafe {
                 self.0.queue[write & (self.0.capacity - 1)]
@@ -192,6 +200,23 @@ impl Producer {
             self.0.write.store(write.wrapping_add(1), Ordering::Release);
             Ok(())
         }
+    }
+}
+
+impl WaitSource for Producer {
+    fn is_ready(&self) -> bool {
+        let write = self.0.write.load(Ordering::Acquire);
+        let read = self.0.read.load(Ordering::Acquire);
+
+        write.wrapping_sub(read) < self.0.capacity
+    }
+
+    fn register(&self, waiter: &Arc<dyn Waiter>, kind: WaiterKind) {
+        self.0.waiter.register(waiter, kind);
+    }
+
+    fn unregister(&self, waiter: &Arc<dyn Waiter>) {
+        self.0.waiter.unregister(waiter);
     }
 }
 
@@ -205,6 +230,7 @@ impl AudioQueue {
             read: CachePadded::new(AtomicUsize::new(0)),
             write: CachePadded::new(AtomicUsize::new(0)),
             capacity,
+            waiter: WaiterSlot::new(),
         }
     }
 }

@@ -8,4 +8,4 @@ mod stream;
 
 pub use client::{ClientError, OutputBuffer, OutputTiming};
 pub use device::DeviceError;
-pub use stream::{WasapiError, WasapiEvent, WasapiStream};
+pub use stream::{ControlReceiver, WasapiError, WasapiEvent, WasapiStream};

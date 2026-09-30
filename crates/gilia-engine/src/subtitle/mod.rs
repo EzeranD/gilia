@@ -10,11 +10,11 @@ use std::{
     thread::JoinHandle,
 };
 
-use crossbeam_channel::Sender;
 use ffmpeg_next::{Stream, codec::Context, format::context::Input, media::Type};
 use libass::{OverrideBits, Renderer, Style, Track};
 
 use crate::{
+    channel::{self, Sender},
     session::{DecoderEffect, PlayerEvent},
     subtitle::decoder::SubtitleDecoder,
     utils::{Clock, TrackedPacket},
@@ -114,8 +114,8 @@ pub fn spawn_sub_stream(
     *shared_renderer.lock().unwrap() = Some(renderer);
     *shared_track.lock().unwrap() = Some(track);
 
-    let (sub_packet_tx, sub_packet_rx) = crossbeam_channel::unbounded();
-    let (sub_tx, sub_rx) = crossbeam_channel::unbounded();
+    let (sub_packet_tx, sub_packet_rx) = channel::Builder::unbounded().channel();
+    let (sub_tx, sub_rx) = channel::Builder::unbounded().channel();
     let sub_event_tx = event_tx.clone();
     let dec_handle = std::thread::Builder::new()
         .name("sub-decoder".into())

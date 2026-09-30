@@ -2,17 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crossbeam_channel::Sender;
 use ffmpeg_next::{Rational, codec::Parameters};
-#[cfg(target_os = "windows")]
-use gilia_windows::EventSendError;
 
 use super::{TrackId, TrackKind, Worker};
 use crate::{
-    audio::AudioBackendSender,
-    engine::{EngineError, ExternalCallback, ExternalEvent},
-    session::Pts,
-    utils::UnparkSender,
+    audio::AudioBackendSender, channel::Sender, engine::ExternalCallback, session::Pts,
     video::VideoOutputSender,
 };
 
@@ -95,12 +89,12 @@ pub(crate) struct SessionChannels {
 }
 
 pub(crate) struct AudioChannels {
-    pub(crate) decoder: UnparkSender<DecoderEffect>,
+    pub(crate) decoder: Sender<DecoderEffect>,
     pub(crate) output: AudioBackendSender,
 }
 
 pub(crate) struct VideoChannels {
-    pub(crate) decoder: crossbeam_channel::Sender<DecoderEffect>,
+    pub(crate) decoder: Sender<DecoderEffect>,
     pub(crate) output: VideoOutputSender,
 }
 

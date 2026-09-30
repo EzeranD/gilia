@@ -5,16 +5,18 @@
 use std::{
     ops::{Deref, DerefMut},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     },
-    thread::{self, Thread},
 };
 
-use crossbeam_channel::{Receiver, SendError, Sender};
 use ffmpeg_next::Packet;
+use tracing::warn;
 
-use crate::engine::get_engine_start;
+use crate::{
+    channel::wait::{WaitSource, Waiter, WaiterKind, WaiterList, WakeMode},
+    engine::get_engine_start,
+};
 
 #[derive(Debug)]
 pub struct Clock {
@@ -25,9 +27,7 @@ pub struct Clock {
 
 #[derive(Debug, Clone)]
 pub struct MemoryBudget {
-    current_bytes: Arc<AtomicUsize>,
-    max_bytes: usize,
-    waker: Arc<ThreadWaker>,
+    inner: Arc<BudgetState>,
 }
 
 pub struct TrackedPacket {
@@ -35,19 +35,11 @@ pub struct TrackedPacket {
     pub budget: MemoryBudget,
 }
 
-pub struct UnparkSender<T> {
-    tx: Sender<T>,
-    waker: Arc<ThreadWaker>,
-}
-
 #[derive(Debug)]
-pub struct ThreadWaker {
-    thread: OnceLock<Thread>,
-}
-
-pub fn unpark_channel<T>(waker: Arc<ThreadWaker>) -> (UnparkSender<T>, Receiver<T>) {
-    let (tx, rx) = crossbeam_channel::unbounded();
-    (UnparkSender { tx, waker }, rx)
+struct BudgetState {
+    current_bytes: AtomicUsize,
+    max_bytes: usize,
+    available: WaiterList,
 }
 
 impl Clock {
@@ -55,6 +47,7 @@ impl Clock {
         self.written_pts.store(pts, Ordering::Relaxed);
         self.end_time.store(end_time, Ordering::Relaxed);
     }
+
     pub fn get_ms(&self) -> i64 {
         let pts = self.written_pts.load(Ordering::Relaxed);
         let end_time = self.end_time.load(Ordering::Relaxed);
@@ -75,33 +68,52 @@ impl Default for Clock {
 }
 
 impl MemoryBudget {
-    pub fn new(max_bytes: usize, waker: Arc<ThreadWaker>) -> Self {
-        let current_bytes = Arc::new(AtomicUsize::new(0));
+    pub fn new(max_bytes: usize) -> Self {
         Self {
-            current_bytes,
-            max_bytes,
-            waker,
+            inner: Arc::new(BudgetState {
+                current_bytes: AtomicUsize::new(0),
+                max_bytes,
+                available: WaiterList::new(),
+            }),
         }
     }
 
     pub fn add(&self, bytes: usize) {
-        self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.inner.current_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn sub(&self, bytes: usize) {
-        let prev = self.current_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        let prev = self.inner.current_bytes.fetch_sub(bytes, Ordering::Relaxed);
         let current = prev.saturating_sub(bytes);
-        if prev >= self.max_bytes && current < self.max_bytes {
-            self.waker.unpark();
+
+        if prev >= self.inner.max_bytes
+            && current < self.inner.max_bytes
+            && let Err(e) = self.inner.available.wake(WakeMode::All)
+        {
+            warn!("Failed to wake memory budget waiters: {e}");
         }
     }
 
     pub fn over_limit(&self) -> bool {
-        self.current_bytes.load(Ordering::Relaxed) >= self.max_bytes
+        self.inner.current_bytes.load(Ordering::Relaxed) >= self.inner.max_bytes
     }
 
     pub fn current_bytes(&self) -> usize {
-        self.current_bytes.load(Ordering::Relaxed)
+        self.inner.current_bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl WaitSource for MemoryBudget {
+    fn is_ready(&self) -> bool {
+        !self.over_limit()
+    }
+
+    fn register(&self, waiter: &Arc<dyn Waiter>, kind: WaiterKind) {
+        self.inner.available.register(waiter, kind);
+    }
+
+    fn unregister(&self, waiter: &Arc<dyn Waiter>) {
+        self.inner.available.unregister(waiter);
     }
 }
 
@@ -129,31 +141,5 @@ impl Deref for TrackedPacket {
 impl Drop for TrackedPacket {
     fn drop(&mut self) {
         self.budget.sub(self.packet.size());
-    }
-}
-
-impl<T> UnparkSender<T> {
-    pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        self.tx.send(msg)?;
-        self.waker.unpark();
-        Ok(())
-    }
-}
-
-impl ThreadWaker {
-    pub fn new() -> Self {
-        Self {
-            thread: OnceLock::new(),
-        }
-    }
-    pub fn set(&self) {
-        self.thread
-            .set(thread::current())
-            .expect("Thread set twice");
-    }
-    pub fn unpark(&self) {
-        if let Some(thread) = self.thread.get() {
-            thread.unpark();
-        }
     }
 }

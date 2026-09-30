@@ -9,9 +9,10 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, Sender, bounded};
 use ffmpeg_next::{Rational, codec::Parameters};
 use tracing::debug;
+
+use crate::channel::{Builder, Receiver, Sender, select_biased};
 
 mod messages;
 mod metadata;
@@ -156,14 +157,14 @@ impl PlayerSession {
         let now = get_engine_start().elapsed().as_nanos() as i64;
         self.shared.clock.update(pts * 1_000_000, now);
 
-        let (seek_tx, seek_rx) = bounded(1);
+        let (seek_tx, seek_rx) = Builder::bounded(1).channel();
         self.channels
             .demuxer(DemuxerEffect::SeekDemuxer(seek_tx, pts));
         self.wait_for(event_rx, &seek_rx);
         self.state.phase = PlaybackPhase::Active;
         self.snapshot();
 
-        let (dec_flush_tx, dec_flush_rx) = bounded(1);
+        let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
         self.channels
             .audio(DecoderEffect::Flush(dec_flush_tx.clone()));
         self.channels
@@ -179,7 +180,7 @@ impl PlayerSession {
             self.snapshot();
         }
 
-        let (con_flush_tx, con_flush_rx) = bounded(1);
+        let (con_flush_tx, con_flush_rx) = Builder::bounded(1).channel();
         self.channels
             .ab(AbEffect::FlushConsumers(con_flush_tx.clone()));
         self.channels
@@ -193,7 +194,7 @@ impl PlayerSession {
             self.snapshot();
         }
 
-        let (sync_tx, sync_rx) = bounded(3);
+        let (sync_tx, sync_rx) = Builder::bounded(3).channel();
 
         let sync = SyncMode::Target(pts);
         self.channels
@@ -250,7 +251,7 @@ impl PlayerSession {
             TrackKind::Video | TrackKind::Subtitle => {}
         }
 
-        let (seek_tx, seek_rx) = bounded(1);
+        let (seek_tx, seek_rx) = Builder::bounded(1).channel();
 
         self.channels
             .demuxer(DemuxerEffect::SwitchStream { seek_tx, kind, id });
@@ -260,17 +261,17 @@ impl PlayerSession {
 
         match kind {
             TrackKind::Audio => {
-                let (dec_flush_tx, dec_flush_rx) = bounded(1);
+                let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
 
                 self.channels.audio(DecoderEffect::Flush(dec_flush_tx));
                 self.wait_for(event_rx, &dec_flush_rx);
 
-                let (out_flush_tx, out_flush_rx) = bounded(1);
+                let (out_flush_tx, out_flush_rx) = Builder::bounded(1).channel();
 
                 self.channels.ab(AbEffect::FlushConsumers(out_flush_tx));
                 self.wait_for(event_rx, &out_flush_rx);
 
-                let (dec_reinit_tx, dec_reinit_rx) = bounded(1);
+                let (dec_reinit_tx, dec_reinit_rx) = Builder::bounded(1).channel();
 
                 self.channels
                     .audio(DecoderEffect::Reinit(dec_reinit_tx, params, time_base));
@@ -281,7 +282,7 @@ impl PlayerSession {
 
                 self.channels.ab(AbEffect::Reinit(rate));
 
-                let (sync_tx, sync_rx) = bounded(1);
+                let (sync_tx, sync_rx) = Builder::bounded(1).channel();
 
                 let sync = SyncMode::FollowClock;
                 self.channels.audio(DecoderEffect::Sync(sync_tx, sync));
@@ -306,17 +307,17 @@ impl PlayerSession {
                 (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
             }
             TrackKind::Video => {
-                let (dec_flush_tx, dec_flush_rx) = bounded(1);
+                let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
 
                 self.channels.video(DecoderEffect::Flush(dec_flush_tx));
                 self.wait_for(event_rx, &dec_flush_rx);
 
-                let (out_flush_tx, out_flush_rx) = bounded(1);
+                let (out_flush_tx, out_flush_rx) = Builder::bounded(1).channel();
 
                 self.channels.vo(VoEffect::FlushConsumers(out_flush_tx));
                 self.wait_for(event_rx, &out_flush_rx);
 
-                let (dec_reinit_tx, dec_reinit_rx) = bounded(1);
+                let (dec_reinit_tx, dec_reinit_rx) = Builder::bounded(1).channel();
 
                 self.channels.video(DecoderEffect::Reinit(
                     dec_reinit_tx,
@@ -325,7 +326,7 @@ impl PlayerSession {
                 ));
                 self.wait_for(event_rx, &dec_reinit_rx);
 
-                let (sync_tx, sync_rx) = bounded(1);
+                let (sync_tx, sync_rx) = Builder::bounded(1).channel();
 
                 let sync = SyncMode::FollowClock;
                 self.channels.video(DecoderEffect::Sync(sync_tx, sync));
@@ -346,12 +347,12 @@ impl PlayerSession {
                 (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
             }
             TrackKind::Subtitle => {
-                let (dec_flush_tx, dec_flush_rx) = bounded(1);
+                let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
 
                 self.channels.sub(DecoderEffect::Flush(dec_flush_tx));
                 self.wait_for(event_rx, &dec_flush_rx);
 
-                let (dec_reinit_tx, dec_reinit_rx) = bounded(1);
+                let (dec_reinit_tx, dec_reinit_rx) = Builder::bounded(1).channel();
 
                 self.channels.sub(DecoderEffect::Reinit(
                     dec_reinit_tx,
@@ -360,7 +361,7 @@ impl PlayerSession {
                 ));
                 self.wait_for(event_rx, &dec_reinit_rx);
 
-                let (sync_tx, sync_rx) = bounded(1);
+                let (sync_tx, sync_rx) = Builder::bounded(1).channel();
 
                 let sync = SyncMode::FollowClock;
                 self.channels.sub(DecoderEffect::Sync(sync_tx, sync));
@@ -441,13 +442,9 @@ impl PlayerSession {
 
     fn wait_for<T>(&mut self, event_rx: &Receiver<PlayerEvent>, response_rx: &Receiver<T>) -> T {
         loop {
-            crossbeam_channel::select! {
-                recv(event_rx) -> event => {
-                    self.apply_event(event.unwrap(), event_rx);
-                },
-                recv(response_rx) -> response => {
-                    return response.unwrap();
-                },
+            select_biased! {
+                recv(event_rx) -> event => self.apply_event(event.unwrap(), event_rx),
+                recv(response_rx) -> response => return response.unwrap(),
             }
         }
     }
