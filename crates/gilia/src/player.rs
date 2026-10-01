@@ -3,112 +3,80 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use gilia_engine::{
-    ActiveTracks,
-    ControlEvent::{self, AudioMaster, ChangeVolumes, Pause, Play, Seek, SelectTrack},
-    EngineConfig, ExternalEvent, PlaybackMode, PlaybackOperation, PlayerEngine,
-    PlayerEvent::Control,
-    TrackKind,
+    ActiveTracks, ControlEvent, ExternalEvent, PlaybackMode, Session, SessionConfig, TrackKind,
 };
 #[cfg(feature = "iced")]
 use gilia_iced::widget::PlayerWidget;
 
 pub struct Player {
-    engine: PlayerEngine,
+    session: Session,
 }
 
 impl Player {
-    pub fn new<F>(path: String, config: EngineConfig, callback: F) -> Self
+    pub fn new<F>(path: String, config: SessionConfig, callback: F) -> Self
     where
         F: Fn(ExternalEvent) + Send + Sync + 'static,
     {
-        let mut engine = PlayerEngine::new(config, callback);
-        let _ = engine.open(path);
-        Self { engine }
+        let mut session = Session::new(config, callback);
+        let _ = session.open(path);
+
+        Self { session }
     }
 
     #[cfg(feature = "iced")]
     pub fn view(&self) -> PlayerWidget<'_> {
-        PlayerWidget::new(&self.engine)
+        PlayerWidget::new(&self.session)
     }
 
     pub fn apply_event(&mut self, event: ControlEvent) {
-        self.engine.apply_event(Control(event));
+        self.session.apply_event(event);
     }
 
     pub fn active_tracks(&self) -> ActiveTracks {
-        self.engine.active_tracks()
+        self.session.active_tracks()
     }
 
     pub fn play(&mut self) {
-        self.engine.apply_event(Control(Play));
+        self.session.play();
     }
 
     pub fn pause(&mut self) {
-        self.engine.apply_event(Control(Pause));
+        self.session.pause();
     }
 
     pub fn select_track(&mut self, kind: TrackKind, id: usize) {
-        let state = self.engine.state.load();
-        if !matches!(state.operation, PlaybackOperation::SwitchingTrack { .. }) {
-            self.engine.apply_event(Control(SelectTrack { kind, id }));
-        }
+        self.session.select_track(kind, id);
     }
 
     pub fn set_audio_master(&mut self, active: bool) {
-        self.engine.apply_event(Control(AudioMaster(active)));
+        self.session.set_audio_master(active);
     }
 
     pub fn toggle_playback(&mut self) -> PlaybackMode {
-        let state = self.engine.state.load();
-        match state.mode {
-            PlaybackMode::Playing => {
-                self.pause();
-                PlaybackMode::Paused
-            }
-            PlaybackMode::Paused => {
-                self.play();
-                PlaybackMode::Playing
-            }
-        }
+        self.session.toggle_playback()
     }
 
     pub fn seek_to(&mut self, pos_ms: i64) {
-        let state = self.engine.state.load();
-        if !matches!(state.operation, PlaybackOperation::Seeking(_)) {
-            self.engine.apply_event(Control(Seek(pos_ms)));
-        }
+        self.session.seek_to(pos_ms);
     }
 
     pub fn seek_rel(&mut self, offset_ms: i64) {
-        let state = self.engine.state.load();
-        if !matches!(state.operation, PlaybackOperation::Seeking(_)) {
-            self.engine
-                .apply_event(Control(Seek(self.position_ms() + offset_ms)));
-        }
+        self.session.seek_rel(offset_ms);
     }
 
-    #[allow(dead_code)]
     pub fn get_volumes(&self) -> Vec<f32> {
-        let volumes = self.engine.audio_info.volume.lock().unwrap();
-        volumes.clone()
+        self.session.get_volumes()
     }
 
-    #[allow(dead_code)]
     pub fn set_volumes(&mut self, volumes: Vec<f32>) {
-        self.engine.apply_event(Control(ChangeVolumes(volumes)));
+        self.session.set_volumes(volumes);
     }
 
     pub fn modify_volumes(&mut self, f: impl Fn(f32) -> f32) -> f32 {
-        let mut volumes = self.engine.audio_info.volume.lock().unwrap();
-        for v in volumes.iter_mut() {
-            *v = f(*v);
-        }
-        self.engine
-            .apply_event(Control(ChangeVolumes(volumes.clone())));
-        volumes.first().copied().unwrap_or(0.0)
+        self.session.modify_volumes(f)
     }
 
     pub fn position_ms(&self) -> i64 {
-        self.engine.position_ms()
+        self.session.position_ms()
     }
 }

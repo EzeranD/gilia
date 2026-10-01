@@ -18,9 +18,9 @@ pub use crate::video::frame::{DecoderMode, VideoFrame, wrap_frame};
 use crate::{
     PlayerEvent::Internal,
     channel::{Receiver, Sender, TryRecvError, select_biased},
-    engine::EngineConfig,
     session::{
-        DecoderEffect, InternalEvent::Drained, PlayerEvent, ReinitDetails, SyncMode, Worker,
+        DecoderEffect, InternalEvent::Drained, PlayerEvent, ReinitDetails, SessionConfig, SyncMode,
+        Worker,
     },
     utils::{Clock, TrackedPacket},
     video::hw_ffmpeg::{HwOption, ManagedVideo, create_decoder, get_hw_options},
@@ -38,7 +38,7 @@ pub struct PendingSync {
 }
 
 pub struct VideoContext {
-    config: Arc<EngineConfig>,
+    config: Arc<SessionConfig>,
     clock: Arc<Clock>,
     decoder: Option<ManagedVideo>,
     mode: DecoderMode,
@@ -65,7 +65,7 @@ pub enum DecoderState {
 impl VideoDecoder {
     #[must_use]
     pub fn new(
-        config: Arc<EngineConfig>,
+        config: Arc<SessionConfig>,
         parameters: Parameters,
         packet_tx: Receiver<TrackedPacket>,
         frame_tx: Sender<VideoFrame>,

@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::{
     channel::wait::{WaitSource, Waiter, WaiterKind, WaiterList, WakeMode},
-    engine::get_engine_start,
+    session::get_session_start,
 };
 
 #[derive(Debug)]
@@ -51,14 +51,14 @@ impl Clock {
     pub fn get_ms(&self) -> i64 {
         let pts = self.written_pts.load(Ordering::Relaxed);
         let end_time = self.end_time.load(Ordering::Relaxed);
-        let now_time = get_engine_start().elapsed().as_nanos() as i64;
+        let now_time = get_session_start().elapsed().as_nanos() as i64;
         (pts - 0.max(end_time - now_time)) / 1_000_000
     }
 }
 
 impl Default for Clock {
     fn default() -> Self {
-        let time = get_engine_start().elapsed().as_nanos() as i64;
+        let time = get_session_start().elapsed().as_nanos() as i64;
         Self {
             active: AtomicBool::new(false),
             written_pts: AtomicI64::default(),

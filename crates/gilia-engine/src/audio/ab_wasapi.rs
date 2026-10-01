@@ -14,8 +14,10 @@ use crate::{
     PlayerEvent::Internal,
     audio::queue::Consumer,
     channel::{EventReceiver, Sender},
-    engine::{ExternalCallback, ExternalEvent, get_engine_start},
-    session::{AbEffect, InternalEvent::Drained, PlayerEvent, Worker},
+    session::{
+        AbEffect, ExternalCallback, ExternalEvent, InternalEvent::Drained, PlayerEvent, Worker,
+        get_session_start,
+    },
     utils::Clock,
 };
 
@@ -166,7 +168,7 @@ fn fill_audio_buffer(
     }
 
     if let Some(pts_ns) = pts_ns {
-        let now = get_engine_start().elapsed().as_nanos() as i64;
+        let now = get_session_start().elapsed().as_nanos() as i64;
         let written_ns = filled_frames as i64 * 1_000_000_000 / timing.rate as i64;
         clock.update(pts_ns, now + timing.delay_ns + written_ns);
     }

@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use gilia_engine::PlayerEngine;
+use gilia_engine::Session;
 use iced::{
     Element, Event, Length, Rectangle, Size,
     advanced::{Layout, Shell, Widget, layout, mouse, renderer, widget::Tree},
@@ -11,15 +11,15 @@ use iced::{
 use crate::{subs::SubPrimitive, video::VideoPrimitive};
 
 pub struct PlayerWidget<'a> {
-    engine: &'a PlayerEngine,
+    session: &'a Session,
     width: Length,
     height: Length,
 }
 
 impl<'a> PlayerWidget<'a> {
-    pub fn new(engine: &'a PlayerEngine) -> Self {
+    pub fn new(session: &'a Session) -> Self {
         Self {
-            engine,
+            session,
             width: Length::Fill,
             height: Length::Fill,
         }
@@ -89,22 +89,22 @@ where
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
-        if let Some(frame) = self.engine.frame() {
+        if let Some(frame) = self.session.frame() {
             let frame_pts = frame.info.pts.unwrap();
             let width = frame.info.width;
             let height = frame.info.height;
             renderer.draw_primitive(
                 layout.bounds(),
-                VideoPrimitive::new(frame, self.engine.video_output.current_pts.clone()),
+                VideoPrimitive::new(frame, self.session.video_output.current_pts.clone()),
             );
             let phys_width = layout.bounds().width * renderer.scale_factor().unwrap_or(1.0);
             let phys_height = layout.bounds().height * renderer.scale_factor().unwrap_or(1.0);
-            self.engine.update_viewport(
+            self.session.update_viewport(
                 phys_width,
                 phys_height,
                 compute_scale(&layout.bounds(), width as f32, height as f32),
             );
-            if let Some(subs) = self.engine.current_subs(frame_pts)
+            if let Some(subs) = self.session.current_subs(frame_pts)
                 && !subs.layers.is_empty()
             {
                 renderer.draw_primitive(

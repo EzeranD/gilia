@@ -34,8 +34,10 @@ use crate::{
     PlayerEvent::Internal,
     audio::queue::Consumer,
     channel::{PipeReceiver, PipeWireError, Sender},
-    engine::{ExternalCallback, ExternalEvent, get_engine_start},
-    session::{AbEffect, InternalEvent::Drained, PlayerEvent, Worker},
+    session::{
+        AbEffect, ExternalCallback, ExternalEvent, InternalEvent::Drained, PlayerEvent, Worker,
+        get_session_start,
+    },
     utils::Clock,
 };
 
@@ -228,7 +230,7 @@ pub fn spawn(
                     if let Some((filled, pts_ns)) = audio_buffer.fill(rate as usize, target_data) {
                         let rate = rate as i64;
                         let stride = audio_buffer.stride as i64;
-                        let mut end = get_engine_start().elapsed().as_nanos() as i64;
+                        let mut end = get_session_start().elapsed().as_nanos() as i64;
                         end += (filled as i64 * 1_000_000_000) / rate;
                         end += (time.delay * 1_000_000_000 * time.rate.num as i64)
                             / time.rate.denom as i64;

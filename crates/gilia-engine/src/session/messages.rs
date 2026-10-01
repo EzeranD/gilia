@@ -4,11 +4,18 @@
 
 use ffmpeg_next::{Rational, codec::Parameters};
 
-use super::{TrackId, TrackKind, Worker};
-use crate::{
-    audio::AudioBackendSender, channel::Sender, engine::ExternalCallback, session::Pts,
-    video::VideoOutputSender,
-};
+use super::{ExternalCallback, PlayerMeta, Pts, SessionError, TrackId, TrackKind, Worker};
+use crate::{audio::AudioBackendSender, channel::Sender, video::VideoOutputSender};
+
+#[derive(Debug, Clone)]
+pub enum ExternalEvent {
+    Opened(PlayerMeta),
+    NewFrame,
+    TrackChanged(TrackKind, TrackId),
+    VolumesChanged(Vec<f32>),
+    Eof,
+    Error(SessionError),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerEvent {

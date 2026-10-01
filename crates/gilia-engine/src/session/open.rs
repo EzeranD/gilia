@@ -12,7 +12,7 @@ use crate::{
     audio::spawn_audio_stream,
     channel::{self, Sender},
     demuxer::Demuxer,
-    engine::{EngineError, ExternalCallback},
+    session::{ExternalCallback, SessionError},
     subtitle::spawn_sub_stream,
     utils::MemoryBudget,
     video::spawn_video_stream,
@@ -23,7 +23,7 @@ pub fn open(
     shared: &SharedPlayerState,
     external_callback: &ExternalCallback,
     event_tx: &Sender<PlayerEvent>,
-) -> Result<(ActiveTracks, SessionChannels, PlayerThreads, PlayerMeta), EngineError> {
+) -> Result<(ActiveTracks, SessionChannels, PlayerThreads, PlayerMeta), SessionError> {
     let ictx = input(&path)?;
     let (demuxer_tx, demuxer_rx) = channel::Builder::unbounded().channel();
     let mut channels = SessionChannels::new(demuxer_tx, external_callback.clone());

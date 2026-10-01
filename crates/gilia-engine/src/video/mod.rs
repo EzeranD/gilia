@@ -10,10 +10,9 @@ use std::{
 use ffmpeg_next::Stream;
 
 use crate::{
-    EngineConfig, PlayerEvent, VideoFrame,
+    PlayerEvent, SessionConfig, VideoFrame,
     channel::{self, Sender},
-    engine::{EngineError, ExternalCallback},
-    session::{DecoderEffect, VoEffect},
+    session::{DecoderEffect, ExternalCallback, SessionError, VoEffect},
     utils::{Clock, TrackedPacket},
     video::{decoder::VideoDecoder, output::VideoOutput},
 };
@@ -30,7 +29,7 @@ pub fn spawn_video_stream(
     video_stream: &Stream,
     event_tx: &Sender<PlayerEvent>,
     external_callback: &ExternalCallback,
-    config: &Arc<EngineConfig>,
+    config: &Arc<SessionConfig>,
     frame: &Arc<Mutex<Option<VideoFrame>>>,
     current_pts: &Arc<AtomicI64>,
     audio_clock: &Arc<Clock>,
@@ -42,7 +41,7 @@ pub fn spawn_video_stream(
         VideoOutputSender,
         Sender<TrackedPacket>,
     ),
-    EngineError,
+    SessionError,
 > {
     let (vo_tx, vp_rx) = channel::Builder::unbounded().channel();
 

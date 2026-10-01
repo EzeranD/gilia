@@ -3,4 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 pub use gilia_engine as engine;
-pub mod player;
+
+mod player;
+
+pub use player::Player;

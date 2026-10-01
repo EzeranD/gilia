@@ -19,8 +19,7 @@ use crate::{
     PlayerEvent::{self, Internal},
     VideoFrame,
     channel::{Receiver, RecvTimeoutError, Sender, TryRecvError},
-    engine::{ExternalCallback, get_engine_start},
-    session::{InternalEvent::Drained, VoEffect, Worker},
+    session::{ExternalCallback, InternalEvent::Drained, VoEffect, Worker, get_session_start},
     utils::Clock,
     video::VideoOutputReceiver,
 };
@@ -189,7 +188,7 @@ impl VideoOutput {
         let pts = frame.info.pts.unwrap_or(0);
         self.current_pts.store(pts, Ordering::Relaxed);
         if !self.audio_clock.active.load(Ordering::Relaxed) {
-            let now = get_engine_start().elapsed().as_nanos() as i64;
+            let now = get_session_start().elapsed().as_nanos() as i64;
             self.audio_clock.update(pts * 1_000_000, now);
         }
         *self.frame.lock().unwrap() = Some(frame);

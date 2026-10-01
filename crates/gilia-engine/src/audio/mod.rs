@@ -13,8 +13,7 @@ use crate::{
     PlayerEvent,
     audio::{decoder::AudioDecoder, queue::queue},
     channel::{self, Sender},
-    engine::{EngineError, ExternalCallback},
-    session::{AbEffect, DecoderEffect},
+    session::{AbEffect, DecoderEffect, ExternalCallback, SessionError},
     utils::{Clock, TrackedPacket},
 };
 
@@ -44,7 +43,7 @@ pub fn spawn_audio_stream(
         AudioBackendSender,
         Sender<TrackedPacket>,
     ),
-    EngineError,
+    SessionError,
 > {
     #[cfg(target_os = "linux")]
     let (ab_sender, ab_receiver) = channel::Builder::unbounded().pipewire().unwrap();

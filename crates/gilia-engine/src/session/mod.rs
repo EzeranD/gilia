@@ -3,472 +3,299 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::VecDeque,
-    sync::{Arc, atomic::Ordering::Relaxed},
-    thread::JoinHandle,
+    sync::{Arc, LazyLock, Mutex, atomic::AtomicI64},
+    thread,
+    time::Instant,
 };
 
 use arc_swap::ArcSwap;
-use ffmpeg_next::{Rational, codec::Parameters};
-use tracing::debug;
+use tracing::error;
 
-use crate::channel::{Builder, Receiver, Sender, select_biased};
+use crate::{
+    channel::{self, Sender},
+    subtitle::decoder::SubtitleFrame,
+    utils::Clock,
+    video::frame::VideoFrame,
+};
 
 mod messages;
 mod metadata;
 mod open;
 mod state;
+mod worker;
 
 pub(crate) use messages::SessionChannels;
 pub use messages::{
-    AbEffect, ControlEvent, DecoderEffect, DemuxerEffect, InternalEvent, PlayerEvent,
-    ReinitDetails, SyncMode, VoEffect,
+    AbEffect, ControlEvent, DecoderEffect, DemuxerEffect, ExternalEvent, InternalEvent,
+    PlayerEvent, ReinitDetails, SyncMode, VoEffect,
 };
 pub use metadata::{PlayerMeta, TrackId, TrackKind, TrackMeta};
 pub use state::{
     ActiveTracks, DrainingState, PlaybackMode, PlaybackOperation, PlaybackPhase, SeekingState,
     SessionState, TrackDrainState, TrackSeekState, Worker,
 };
+pub use worker::PlayerThreads;
+use worker::SessionWorker;
 
-use crate::{
-    ExternalEvent, SharedPlayerState,
-    engine::{EngineError, ExternalCallback, get_engine_start},
-    session::{
-        TrackSeekState::{Flushed, Synced},
-        open::open,
-    },
-};
 pub type Pts = state::Pts;
 
-pub struct PlayerSession {
-    pub state: SessionState,
-    pub shared: SharedPlayerState,
-    pub channels: SessionChannels,
-    op_queue: VecDeque<PlayerEvent>,
-    pub threads: PlayerThreads,
-    pub meta: PlayerMeta,
-    snapshot_state: Arc<ArcSwap<SessionState>>,
+pub struct Session {
+    config: Arc<SessionConfig>,
+    pub state: Arc<ArcSwap<SessionState>>,
+    pub clock: Arc<Clock>,
+    external_callback: ExternalCallback,
+    event_tx: Option<Sender<PlayerEvent>>,
+    audio_info: AudioInfo,
+    pub video_output: VideoOutput,
+    sub_output: SubOutput,
 }
 
-#[derive(Default)]
-pub struct PlayerThreads {
-    pub demuxer: Option<JoinHandle<()>>,
-    pub audio_decoder: Option<JoinHandle<()>>,
-    pub audio_backend: Option<JoinHandle<()>>,
-    pub video_decoder: Option<JoinHandle<()>>,
-    pub video_output: Option<JoinHandle<()>>,
-    pub sub_decoder: Option<JoinHandle<()>>,
+#[derive(Clone)]
+pub struct SharedPlayerState {
+    pub config: Arc<SessionConfig>,
+    pub clock: Arc<Clock>,
+    pub audio_info: AudioInfo,
+    pub video_output: VideoOutput,
+    pub sub_output: SubOutput,
 }
 
-impl PlayerSession {
-    pub fn open(
-        path: &str,
-        shared: SharedPlayerState,
-        external_callback: &ExternalCallback,
-        event_tx: Sender<PlayerEvent>,
-        snapshot_state: Arc<ArcSwap<SessionState>>,
-    ) -> Result<Self, EngineError> {
-        let (streams, channels, threads, meta) = open(path, &shared, external_callback, &event_tx)?;
-        let session = Self {
-            state: SessionState::new(streams),
-            shared,
-            channels,
-            op_queue: VecDeque::new(),
-            threads,
-            meta,
-            snapshot_state,
+#[derive(Debug, Clone, Copy)]
+pub struct SessionConfig {
+    pub hw_dec: bool,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SessionError {
+    #[error("failed to open input file")]
+    InputOpenError(#[from] ffmpeg_next::Error),
+}
+
+#[derive(Clone)]
+pub struct AudioInfo {
+    pub volume: Arc<Mutex<Vec<f32>>>,
+}
+
+#[derive(Clone)]
+pub struct VideoOutput {
+    pub current_pts: Arc<AtomicI64>,
+    pub(crate) frame: Arc<Mutex<Option<VideoFrame>>>,
+}
+
+#[derive(Clone)]
+pub struct SubOutput {
+    pub renderer: Arc<Mutex<Option<libass::Renderer>>>,
+    pub track: Arc<Mutex<Option<libass::Track>>>,
+}
+
+pub type ExternalCallback = Arc<dyn Fn(ExternalEvent) + Send + Sync>;
+
+static SESSION_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+pub fn get_session_start() -> &'static Instant {
+    &SESSION_START
+}
+
+impl Session {
+    #[must_use]
+    pub fn new<F>(config: SessionConfig, callback: F) -> Self
+    where
+        F: Fn(ExternalEvent) + Send + Sync + 'static,
+    {
+        ffmpeg_next::init().unwrap();
+        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
+
+        get_session_start();
+        let external_callback = Arc::new(callback);
+
+        Self {
+            config: Arc::new(config),
+            state: Arc::new(ArcSwap::from_pointee(SessionState::new(ActiveTracks {
+                audio: None,
+                video: None,
+                subs: None,
+            }))),
+            clock: Arc::new(Clock::default()),
+            external_callback,
+            event_tx: None,
+            audio_info: AudioInfo {
+                volume: Arc::new(Mutex::new(Vec::new())),
+            },
+            video_output: VideoOutput {
+                current_pts: Arc::new(AtomicI64::new(0)),
+                frame: Arc::new(Mutex::new(None)),
+            },
+            sub_output: SubOutput {
+                renderer: Arc::new(Mutex::new(None)),
+                track: Arc::new(Mutex::new(None)),
+            },
+        }
+    }
+
+    pub fn open(&mut self, path: String) -> Result<(), SessionError> {
+        let (event_tx, event_rx) = channel::Builder::unbounded().channel();
+        self.event_tx = Some(event_tx.clone());
+        let session_state = self.state.clone();
+
+        let shared = SharedPlayerState {
+            config: self.config.clone(),
+            clock: self.clock.clone(),
+            audio_info: self.audio_info.clone(),
+            video_output: self.video_output.clone(),
+            sub_output: self.sub_output.clone(),
         };
-        session.snapshot();
-        Ok(session)
+        let external_callback = self.external_callback.clone();
+        let event_tx_clone = event_tx.clone();
+
+        let _ = thread::Builder::new()
+            .name("session".into())
+            .spawn(move || {
+                match SessionWorker::open(
+                    &path,
+                    shared,
+                    &external_callback,
+                    event_tx_clone,
+                    session_state.clone(),
+                ) {
+                    Ok(mut worker) => {
+                        external_callback(ExternalEvent::Opened(worker.meta.clone()));
+
+                        while let Ok(event) = event_rx.recv() {
+                            worker.apply_event(event, &event_rx);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to open a playback session for '{}': {:?}", path, e);
+                        external_callback(ExternalEvent::Error(e));
+                    }
+                }
+            });
+
+        Ok(())
     }
 
-    pub fn snapshot(&self) {
-        self.snapshot_state.store(Arc::new(self.state));
-    }
-
-    pub fn apply_event(&mut self, event: PlayerEvent, event_rx: &Receiver<PlayerEvent>) {
-        debug!("Event received: {event:?}");
-        match event {
-            PlayerEvent::Control(event) => self.apply_control(event, event_rx),
-            PlayerEvent::Internal(event) => self.apply_internal(event),
-        }
-    }
-
-    fn apply_control(&mut self, event: ControlEvent, event_rx: &Receiver<PlayerEvent>) {
-        match event {
-            ControlEvent::Play => {
-                self.state.mode = PlaybackMode::Playing;
-                self.snapshot();
-                self.channels.ab(AbEffect::Output(true));
-                self.channels.vo(VoEffect::Output(true));
-            }
-            ControlEvent::Pause => {
-                self.state.mode = PlaybackMode::Paused;
-                self.snapshot();
-                self.channels.ab(AbEffect::Output(false));
-                self.channels.vo(VoEffect::Output(false));
-            }
-            ControlEvent::ChangeVolumes(vol) => {
-                self.channels.ab(AbEffect::ModifyVolume(vol));
-            }
-            ControlEvent::AudioMaster(active) => {
-                self.shared
-                    .clock
-                    .active
-                    .store(active, std::sync::atomic::Ordering::Relaxed);
-            }
-            ControlEvent::Seek(pts) => {
-                if self.state.is_busy() {
-                    debug!("Adding {event:?} to the queue");
-                    self.op_queue.push_back(PlayerEvent::Control(event));
-                    return;
-                }
-                self.seek(event_rx, pts);
-            }
-            ControlEvent::SelectTrack { id, kind } => {
-                if self.state.is_busy() {
-                    self.op_queue.push_back(PlayerEvent::Control(event));
-                    return;
-                }
-                let Some(track) = self.meta.get_track(id) else {
-                    return;
-                };
-                if track.kind != kind {
-                    return;
-                }
-                let params = track.params.clone();
-                let time_base = track.time_base;
-                self.switch_track(event_rx, id, kind, params, time_base);
-            }
-        }
-        if !self.state.is_busy()
-            && let Some(event) = self.op_queue.pop_front()
+    pub fn apply_event(&self, event: ControlEvent) {
+        if let Some(tx) = &self.event_tx
+            && let Err(e) = tx.send(PlayerEvent::Control(event))
         {
-            self.apply_event(event, event_rx);
+            error!("Failed to send event: {}", e);
         }
     }
 
-    fn seek(&mut self, event_rx: &Receiver<PlayerEvent>, pts: i64) {
-        let mut state = SeekingState::new(pts);
-        self.state.operation = PlaybackOperation::Seeking(state);
-        self.snapshot();
-        self.channels.ab(AbEffect::Output(false));
-        self.channels.vo(VoEffect::Output(false));
-        let now = get_engine_start().elapsed().as_nanos() as i64;
-        self.shared.clock.update(pts * 1_000_000, now);
+    pub fn active_tracks(&self) -> ActiveTracks {
+        self.state.load().tracks
+    }
 
-        let (seek_tx, seek_rx) = Builder::bounded(1).channel();
-        self.channels
-            .demuxer(DemuxerEffect::SeekDemuxer(seek_tx, pts));
-        self.wait_for(event_rx, &seek_rx);
-        self.state.phase = PlaybackPhase::Active;
-        self.snapshot();
+    pub fn play(&mut self) {
+        self.apply_event(ControlEvent::Play);
+    }
 
-        let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
-        self.channels
-            .audio(DecoderEffect::Flush(dec_flush_tx.clone()));
-        self.channels
-            .video(DecoderEffect::Flush(dec_flush_tx.clone()));
-        self.channels
-            .sub(DecoderEffect::Flush(dec_flush_tx.clone()));
+    pub fn pause(&mut self) {
+        self.apply_event(ControlEvent::Pause);
+    }
 
-        while !state.dec_flushed(&self.state.tracks) {
-            let resp = self.wait_for(event_rx, &dec_flush_rx);
-            debug!(?resp);
-            state.set_state(resp, Flushed);
-            self.state.operation = PlaybackOperation::Seeking(state);
-            self.snapshot();
+    pub fn select_track(&mut self, kind: TrackKind, id: usize) {
+        let state = self.state.load();
+
+        if !matches!(state.operation, PlaybackOperation::SwitchingTrack { .. }) {
+            self.apply_event(ControlEvent::SelectTrack { kind, id });
         }
+    }
 
-        let (con_flush_tx, con_flush_rx) = Builder::bounded(1).channel();
-        self.channels
-            .ab(AbEffect::FlushConsumers(con_flush_tx.clone()));
-        self.channels
-            .vo(VoEffect::FlushConsumers(con_flush_tx.clone()));
+    pub fn set_audio_master(&mut self, active: bool) {
+        self.apply_event(ControlEvent::AudioMaster(active));
+    }
 
-        while !state.out_flushed(&self.state.tracks) {
-            let resp = self.wait_for(event_rx, &con_flush_rx);
-            debug!(?resp);
-            state.set_state(resp, Flushed);
-            self.state.operation = PlaybackOperation::Seeking(state);
-            self.snapshot();
-        }
+    pub fn toggle_playback(&mut self) -> PlaybackMode {
+        let state = self.state.load();
 
-        let (sync_tx, sync_rx) = Builder::bounded(3).channel();
-
-        let sync = SyncMode::Target(pts);
-        self.channels
-            .audio(DecoderEffect::Sync(sync_tx.clone(), sync));
-        self.channels
-            .video(DecoderEffect::Sync(sync_tx.clone(), sync));
-        self.channels.sub(DecoderEffect::Sync(sync_tx, sync));
-        self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-
-        while !state.dec_synced(&self.state.tracks) {
-            let resp = self.wait_for(event_rx, &sync_rx);
-            debug!(?resp);
-            state.set_state(resp, Synced);
-            self.state.operation = PlaybackOperation::Seeking(state);
-            self.snapshot();
-        }
-
-        self.state.operation = PlaybackOperation::None;
-        if self.state.phase == PlaybackPhase::InputExhausted {
-            self.state.phase = PlaybackPhase::Draining(DrainingState::new());
-            self.channels.audio(DecoderEffect::Drain);
-            self.channels.video(DecoderEffect::Drain);
-        }
-        self.snapshot();
-
-        match self.state.mode {
+        match state.mode {
             PlaybackMode::Playing => {
-                self.channels.ab(AbEffect::Output(true));
-                self.channels.vo(VoEffect::Present);
-                self.channels.vo(VoEffect::Output(true));
+                self.pause();
+                PlaybackMode::Paused
             }
             PlaybackMode::Paused => {
-                self.channels.vo(VoEffect::Present);
+                self.play();
+                PlaybackMode::Playing
             }
         }
     }
 
-    fn switch_track(
-        &mut self,
-        event_rx: &Receiver<PlayerEvent>,
-        id: TrackId,
-        kind: TrackKind,
-        params: Parameters,
-        time_base: Rational,
-    ) {
-        self.state.operation = PlaybackOperation::SwitchingTrack { kind, id };
-        self.snapshot();
+    pub fn seek_to(&mut self, pos_ms: i64) {
+        let state = self.state.load();
 
-        match kind {
-            TrackKind::Audio => {
-                self.shared.clock.active.store(false, Relaxed);
-                self.channels.ab(AbEffect::Output(false));
-            }
-            TrackKind::Video | TrackKind::Subtitle => {}
-        }
-
-        let (seek_tx, seek_rx) = Builder::bounded(1).channel();
-
-        self.channels
-            .demuxer(DemuxerEffect::SwitchStream { seek_tx, kind, id });
-        self.wait_for(event_rx, &seek_rx);
-        self.state.phase = PlaybackPhase::Active;
-        self.snapshot();
-
-        match kind {
-            TrackKind::Audio => {
-                let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
-
-                self.channels.audio(DecoderEffect::Flush(dec_flush_tx));
-                self.wait_for(event_rx, &dec_flush_rx);
-
-                let (out_flush_tx, out_flush_rx) = Builder::bounded(1).channel();
-
-                self.channels.ab(AbEffect::FlushConsumers(out_flush_tx));
-                self.wait_for(event_rx, &out_flush_rx);
-
-                let (dec_reinit_tx, dec_reinit_rx) = Builder::bounded(1).channel();
-
-                self.channels
-                    .audio(DecoderEffect::Reinit(dec_reinit_tx, params, time_base));
-                let resp = self.wait_for(event_rx, &dec_reinit_rx);
-                let ReinitDetails::Audio { rate } = resp.1 else {
-                    unreachable!("Audio decoder returned invalid details");
-                };
-
-                self.channels.ab(AbEffect::Reinit(rate));
-
-                let (sync_tx, sync_rx) = Builder::bounded(1).channel();
-
-                let sync = SyncMode::FollowClock;
-                self.channels.audio(DecoderEffect::Sync(sync_tx, sync));
-                self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-                self.wait_for(event_rx, &sync_rx);
-
-                self.shared
-                    .clock
-                    .active
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.state.tracks.audio = Some(id);
-                if self.state.mode == PlaybackMode::Playing {
-                    self.channels.ab(AbEffect::Output(true));
-                }
-                self.state.operation = PlaybackOperation::None;
-                if self.state.phase == PlaybackPhase::InputExhausted {
-                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
-                    self.channels.audio(DecoderEffect::Drain);
-                    self.channels.video(DecoderEffect::Drain);
-                }
-                self.snapshot();
-                (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
-            }
-            TrackKind::Video => {
-                let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
-
-                self.channels.video(DecoderEffect::Flush(dec_flush_tx));
-                self.wait_for(event_rx, &dec_flush_rx);
-
-                let (out_flush_tx, out_flush_rx) = Builder::bounded(1).channel();
-
-                self.channels.vo(VoEffect::FlushConsumers(out_flush_tx));
-                self.wait_for(event_rx, &out_flush_rx);
-
-                let (dec_reinit_tx, dec_reinit_rx) = Builder::bounded(1).channel();
-
-                self.channels.video(DecoderEffect::Reinit(
-                    dec_reinit_tx,
-                    params.clone(),
-                    time_base,
-                ));
-                self.wait_for(event_rx, &dec_reinit_rx);
-
-                let (sync_tx, sync_rx) = Builder::bounded(1).channel();
-
-                let sync = SyncMode::FollowClock;
-                self.channels.video(DecoderEffect::Sync(sync_tx, sync));
-                self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-                self.wait_for(event_rx, &sync_rx);
-
-                self.state.tracks.video = Some(id);
-                if self.state.mode == PlaybackMode::Paused {
-                    self.channels.vo(VoEffect::Present);
-                }
-                self.state.operation = PlaybackOperation::None;
-                if self.state.phase == PlaybackPhase::InputExhausted {
-                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
-                    self.channels.audio(DecoderEffect::Drain);
-                    self.channels.video(DecoderEffect::Drain);
-                }
-                self.snapshot();
-                (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
-            }
-            TrackKind::Subtitle => {
-                let (dec_flush_tx, dec_flush_rx) = Builder::bounded(1).channel();
-
-                self.channels.sub(DecoderEffect::Flush(dec_flush_tx));
-                self.wait_for(event_rx, &dec_flush_rx);
-
-                let (dec_reinit_tx, dec_reinit_rx) = Builder::bounded(1).channel();
-
-                self.channels.sub(DecoderEffect::Reinit(
-                    dec_reinit_tx,
-                    params.clone(),
-                    time_base,
-                ));
-                self.wait_for(event_rx, &dec_reinit_rx);
-
-                let (sync_tx, sync_rx) = Builder::bounded(1).channel();
-
-                let sync = SyncMode::FollowClock;
-                self.channels.sub(DecoderEffect::Sync(sync_tx, sync));
-                self.channels.demuxer(DemuxerEffect::ResumeDemuxer);
-                self.wait_for(event_rx, &sync_rx);
-
-                self.state.tracks.subs = Some(id);
-                self.state.operation = PlaybackOperation::None;
-                if self.state.phase == PlaybackPhase::InputExhausted {
-                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
-                    self.channels.audio(DecoderEffect::Drain);
-                    self.channels.video(DecoderEffect::Drain);
-                }
-                self.snapshot();
-                (self.channels.external_callback)(ExternalEvent::TrackChanged(kind, id));
-            }
-        }
-        if !self.state.is_busy() && self.state.phase == PlaybackPhase::InputExhausted {
-            self.state.phase = PlaybackPhase::Draining(DrainingState::new());
-            self.snapshot();
-            self.channels.audio(DecoderEffect::Drain);
-            self.channels.video(DecoderEffect::Drain);
+        if !matches!(state.operation, PlaybackOperation::Seeking(_)) {
+            self.apply_event(ControlEvent::Seek(pos_ms));
         }
     }
 
-    fn apply_internal(&mut self, event: InternalEvent) {
-        match event {
-            InternalEvent::DemuxerEof => {
-                self.state.phase = PlaybackPhase::InputExhausted;
-                if !self.state.is_busy() {
-                    self.state.phase = PlaybackPhase::Draining(DrainingState::new());
-                    self.channels.audio(DecoderEffect::Drain);
-                    self.channels.video(DecoderEffect::Drain);
-                }
-                self.snapshot();
-            }
-            InternalEvent::Drained(worker) => {
-                if !matches!(self.state.phase, PlaybackPhase::Draining(_)) {
-                    return;
-                }
-                if let PlaybackPhase::Draining(draining) = &mut self.state.phase {
-                    draining.set_state(worker, TrackDrainState::Drained);
-                }
-                self.snapshot();
+    pub fn seek_rel(&mut self, offset_ms: i64) {
+        let state = self.state.load();
 
-                match worker {
-                    Worker::AudioDecoder | Worker::VideoDecoder => {
-                        self.channels.ab(AbEffect::DrainOutput);
-                        self.channels.vo(VoEffect::DrainOutput);
-                    }
-                    Worker::AudioOutput | Worker::VideoOutput => {
-                        match worker {
-                            Worker::AudioOutput => {
-                                self.channels.ab(AbEffect::Output(false));
-                            }
-                            Worker::VideoOutput => {
-                                self.channels.vo(VoEffect::Output(false));
-                            }
-                            _ => unreachable!(),
-                        }
-                        let out_drained = match &self.state.phase {
-                            PlaybackPhase::Draining(draining) => {
-                                draining.out_drained(&self.state.tracks)
-                            }
-                            _ => unreachable!(),
-                        };
-                        if out_drained {
-                            self.state.phase = PlaybackPhase::Eof;
-                            self.snapshot();
-                            (self.channels.external_callback)(ExternalEvent::Eof);
-                        }
-                    }
-                    Worker::SubDecoder => todo!(),
-                }
-            }
+        if !matches!(state.operation, PlaybackOperation::Seeking(_)) {
+            self.apply_event(ControlEvent::Seek(self.position_ms() + offset_ms));
         }
     }
 
-    fn wait_for<T>(&mut self, event_rx: &Receiver<PlayerEvent>, response_rx: &Receiver<T>) -> T {
-        loop {
-            select_biased! {
-                recv(event_rx) -> event => self.apply_event(event.unwrap(), event_rx),
-                recv(response_rx) -> response => return response.unwrap(),
-            }
+    pub fn get_volumes(&self) -> Vec<f32> {
+        let volumes = self.audio_info.volume.lock().unwrap();
+        volumes.clone()
+    }
+
+    pub fn set_volumes(&mut self, volumes: Vec<f32>) {
+        self.apply_event(ControlEvent::ChangeVolumes(volumes));
+    }
+
+    pub fn modify_volumes(&mut self, f: impl Fn(f32) -> f32) -> f32 {
+        let mut volumes = self.audio_info.volume.lock().unwrap();
+
+        for v in volumes.iter_mut() {
+            *v = f(*v);
+        }
+
+        self.apply_event(ControlEvent::ChangeVolumes(volumes.clone()));
+        volumes.first().copied().unwrap_or(0.0)
+    }
+
+    pub fn position_ms(&self) -> i64 {
+        self.clock.get_ms()
+    }
+
+    pub fn frame(&self) -> Option<VideoFrame> {
+        self.video_output.frame.lock().unwrap().clone()
+    }
+
+    pub fn update_viewport(&self, widget_width: f32, widget_height: f32, scale: [f32; 2]) {
+        let mut renderer_guard = self.sub_output.renderer.lock().unwrap();
+
+        if let Some(renderer) = &mut *renderer_guard {
+            let scaled = (widget_width * scale[0], widget_height * scale[1]);
+            let margin = (
+                (widget_width - scaled.0) / 2.0,
+                (widget_height - scaled.1) / 2.0,
+            );
+
+            renderer.set_frame_size(widget_width.round() as i32, widget_height.round() as i32);
+            renderer.set_margins(
+                margin.1.round() as i32,
+                margin.1.round() as i32,
+                margin.0.round() as i32,
+                margin.0.round() as i32,
+            );
         }
     }
-}
 
-impl Drop for PlayerThreads {
-    fn drop(&mut self) {
-        if let Some(thread) = self.demuxer.take() {
-            thread.join().ok();
-        }
-        if let Some(thread) = self.audio_decoder.take() {
-            thread.join().ok();
-        }
-        if let Some(thread) = self.audio_backend.take() {
-            thread.join().ok();
-        }
-        if let Some(thread) = self.video_decoder.take() {
-            thread.join().ok();
-        }
-        if let Some(thread) = self.sub_decoder.take() {
-            thread.join().ok();
-        }
-        if let Some(thread) = self.video_output.take() {
-            thread.join().ok();
-        }
+    pub fn current_subs(&self, frame_pts: i64) -> Option<SubtitleFrame> {
+        let mut renderer_guard = self.sub_output.renderer.lock().unwrap();
+        let mut track_guard = self.sub_output.track.lock().unwrap();
+        let (Some(renderer), Some(track)) = (&mut *renderer_guard, &mut *track_guard) else {
+            return None;
+        };
+
+        let (images, change) = renderer.render_frame(track, frame_pts);
+
+        Some(SubtitleFrame {
+            layers: images.into_iter().flatten().collect(),
+            change,
+        })
     }
 }

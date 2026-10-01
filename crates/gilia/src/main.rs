@@ -10,12 +10,11 @@ use std::{
 
 use clap::Parser;
 use gilia::{
+    Player,
     engine::{
-        EngineConfig,
         ExternalEvent::{self, Opened, TrackChanged, VolumesChanged},
-        PlayerMeta, TrackKind,
+        PlayerMeta, SessionConfig, TrackKind,
     },
-    player::Player,
 };
 use iced::{
     Background, Color, Element, Length, Task, Theme,
@@ -103,7 +102,7 @@ impl App {
         let cb = move |event| {
             event_tx.send(event).ok();
         };
-        let player = Player::new(path, EngineConfig { hw_dec: true }, cb);
+        let player = Player::new(path, SessionConfig { hw_dec: true }, cb);
         let event_task = Task::stream(iced::stream::channel(
             100,
             move |mut sender: futures::channel::mpsc::Sender<Message>| async move {
